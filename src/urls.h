@@ -11,6 +11,8 @@ namespace urls {
 
 std::string Main();
 std::string API();
+// Public Toggl Track API host (api.track.toggl.com), serving /api/v9/*
+std::string TrackAPI();
 std::string SyncAPI();
 std::string TimelineUpload();
 std::string WebSocket();

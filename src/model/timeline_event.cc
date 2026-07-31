@@ -67,14 +67,32 @@ void TimelineEvent::SetUploaded(bool value) {
         SetDirty();
 }
 
-Json::Value TimelineEvent::SaveToJSON(int) const {
+Json::Value TimelineEvent::SaveToJSON(int apiVersion) const {
     Json::Value n;
     n["guid"] = GUID();
-    n["filename"] = Filename();
-    n["title"] = Title();
-    n["start_time"] = Json::Int64(Start());
-    n["end_time"] = Json::Int64(EndTime());
     n["created_with"] = "timeline";
+
+    if (apiVersion <= 8) {
+        // Legacy shape, kept for reference and tests. The v8 API was shut
+        // down by Toggl in 2023, so this is no longer sent to the backend.
+        n["filename"] = Filename();
+        n["title"] = Title();
+        n["start_time"] = Json::Int64(Start());
+        n["end_time"] = Json::Int64(EndTime());
+        return n;
+    }
+
+    // v9 shape of POST /api/v9/timeline: the file name and the window title
+    // were renamed and the epoch timestamps became ISO 8601 strings in UTC
+    // (2006-01-02T15:04:05Z), like everywhere else in API v9.
+    n["app_name"] = Filename();
+    n["window_title"] = Title();
+    if (Start()) {
+        n["start"] = Formatter::Format8601(Start());
+    }
+    if (EndTime()) {
+        n["end"] = Formatter::Format8601(EndTime());
+    }
     return n;
 }
 

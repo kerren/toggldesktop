@@ -81,13 +81,16 @@ error TimelineUploader::upload(TimelineBatch *batch) {
 
     std::string json = convertTimelineToJSON(
         batch->Events(),
-        batch->DesktopID());
+        batch->DesktopID(),
+        kTimelineAPIVersion);
     logger().trace(json);
 
-    // Not implemented in v9 as of 12.05.2017
+    // The timeline endpoint is not part of the documented public API, but it
+    // moved to /api/v9 on api.track.toggl.com together with the rest of the
+    // API when v8 was shut down.
     HTTPRequest req;
     req.host = urls::TimelineUpload();
-    req.relative_url = "/api/v8/timeline";
+    req.relative_url = "/api/v9/timeline";
     req.payload = json;
     req.basic_auth_username = batch->APIToken();
     req.basic_auth_password = "api_token";
@@ -97,7 +100,8 @@ error TimelineUploader::upload(TimelineBatch *batch) {
 
 std::string convertTimelineToJSON(
     const std::vector<const TimelineEvent*> &timeline_events,
-    const std::string &desktop_id) {
+    const std::string &desktop_id,
+    int apiVersion) {
 
     Json::Value root;
 
@@ -105,7 +109,7 @@ std::string convertTimelineToJSON(
             i != timeline_events.end();
             ++i) {
         const TimelineEvent *event = *i;
-        Json::Value n = event->SaveToJSON();
+        Json::Value n = event->SaveToJSON(apiVersion);
         n["desktop_id"] = desktop_id;
         root.append(n);
     }

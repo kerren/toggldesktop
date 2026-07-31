@@ -1832,15 +1832,17 @@ void Context::onTimelineUpdateServerSettings(Poco::Util::TimerTask&) {  // NOLIN
         apitoken = user_->APIToken();
     }
 
-    // Not implemented in v9 as of 12.05.2017
+    // v8 had a dedicated /timeline_settings endpoint. In v9 record_timeline
+    // is a property of the user, updated through PUT /api/v9/me (and read
+    // back from GET /api/v9/me).
     HTTPRequest req;
-    req.host = urls::TimelineUpload();
-    req.relative_url = "/api/v8/timeline_settings";
+    req.host = urls::API();
+    req.relative_url = "/api/v9/me";
     req.payload = json;
     req.basic_auth_username = apitoken;
     req.basic_auth_password = "api_token";
 
-    HTTPResponse resp = TogglClient::GetInstance().Post(req);
+    HTTPResponse resp = TogglClient::GetInstance().Put(req);
     if (resp.err != noError) {
         displayError(resp.err);
         logger.error(resp.body);
@@ -1937,10 +1939,9 @@ void Context::onSendFeedback(Poco::Util::TimerTask&) {  // NOLINT
                      "application/json",
                      "settings.json"));
 
-    // Not implemented in v9 as of 12.05.2017
     HTTPRequest req;
     req.host = urls::API();
-    req.relative_url ="/api/v8/feedback/web";
+    req.relative_url ="/api/v9/feedback/web";
     req.basic_auth_username = api_token_value;
     req.basic_auth_password = api_token_name;
     req.form = &form;
@@ -4573,9 +4574,8 @@ error Context::OpenReportsInBrowser() {
         return displayError("Could not extract login token from JSON");
     }
 
-    // Not implemented in v9 as of 12.05.2017
     std::stringstream ss;
-    ss  << urls::Main() << "/api/v8/desktop_login"
+    ss  << urls::Main() << "/api/v9/desktop_login"
         << "?login_token=" << login_token
         << "&goto=reports";
     UI()->DisplayURL(ss.str());
@@ -6059,7 +6059,7 @@ error Context::me(
 
         std::stringstream ss;
         ss << "/api/"
-           << kAPIV8
+           << kAPIV9
            << "/me"
            << "?app_name=" << TogglClient::Config.AppName
            << "&with_related_data=true";

@@ -835,7 +835,11 @@ error User::loadUserFromJSON(const Json::Value &data) {
         SetID(data["id"].asUInt64());
     else
         SetID(data["user_id"].asUInt64());
-    SetDefaultWID(data["default_wid"].asUInt64());
+    // v8 called it default_wid, v9 calls it default_workspace_id
+    if (data.isMember("default_wid"))
+        SetDefaultWID(data["default_wid"].asUInt64());
+    else
+        SetDefaultWID(data["default_workspace_id"].asUInt64());
     SetAPIToken(data["api_token"].asString());
     SetEmail(data["email"].asString());
     SetFullname(data["fullname"].asString());
