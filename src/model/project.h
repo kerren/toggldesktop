@@ -50,7 +50,7 @@ class TOGGL_INTERNAL_EXPORT Project : public BaseModel {
     std::string ModelName() const override;
     std::string ModelURL() const override;
     void LoadFromJSON(const Json::Value &value, bool);
-    Json::Value SaveToJSON(int apiVersion = 8) const override;
+    Json::Value SaveToJSON(int apiVersion = 9) const override;
     Json::Value SyncMetadata() const override;
     Json::Value SyncPayload() const override;
     bool DuplicateResource(const toggl::error &err) const override;

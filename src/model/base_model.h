@@ -96,7 +96,7 @@ class TOGGL_INTERNAL_EXPORT BaseModel {
     virtual std::string ModelName() const = 0;
     virtual std::string ModelURL() const = 0;
 
-    virtual Json::Value SaveToJSON(int apiVersion = 8) const {
+    virtual Json::Value SaveToJSON(int apiVersion = 9) const {
         return 0;
     }
     virtual std::string SyncType() const;

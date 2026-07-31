@@ -1714,6 +1714,44 @@ TEST(JSON, TimeEntry) {
     ASSERT_EQ(t.DurOnly(), t2.DurOnly());
 }
 
+// Models are pushed to /api/v9 URLs, so the default payload must use the v9
+// field names. The v8 names are only reachable by asking for them explicitly.
+TEST(JSON, TimeEntrySaveToJSONDefaultsToV9) {
+    TimeEntry t;
+    t.SetWID(123456789);
+    t.SetPID(2567324, false);
+    t.SetTID(9876543, false);
+
+    const Json::Value v9 = t.SaveToJSON();
+    ASSERT_EQ(Poco::UInt64(123456789), v9["workspace_id"].asUInt64());
+    ASSERT_EQ(Poco::UInt64(2567324), v9["project_id"].asUInt64());
+    ASSERT_EQ(Poco::UInt64(9876543), v9["task_id"].asUInt64());
+    ASSERT_FALSE(v9.isMember("wid"));
+    ASSERT_FALSE(v9.isMember("pid"));
+    ASSERT_FALSE(v9.isMember("tid"));
+
+    const Json::Value v8 = t.SaveToJSON(8);
+    ASSERT_EQ(Poco::UInt64(123456789), v8["wid"].asUInt64());
+    ASSERT_EQ(Poco::UInt64(2567324), v8["pid"].asUInt64());
+    ASSERT_EQ(Poco::UInt64(9876543), v8["tid"].asUInt64());
+}
+
+TEST(JSON, ProjectSaveToJSONDefaultsToV9) {
+    Project p;
+    p.SetWID(123456789);
+    p.SetCID(878318);
+
+    const Json::Value v9 = p.SaveToJSON();
+    ASSERT_EQ(Poco::UInt64(123456789), v9["workspace_id"].asUInt64());
+    ASSERT_EQ(Poco::UInt64(878318), v9["client_id"].asUInt64());
+    ASSERT_FALSE(v9.isMember("wid"));
+    ASSERT_FALSE(v9.isMember("cid"));
+
+    const Json::Value v8 = p.SaveToJSON(8);
+    ASSERT_EQ(Poco::UInt64(123456789), v8["wid"].asUInt64());
+    ASSERT_EQ(Poco::UInt64(878318), v8["cid"].asUInt64());
+}
+
 TEST(User, TimeOfDayFormat) {
     User u;
     u.SetTimeOfDayFormat("H:mm");
