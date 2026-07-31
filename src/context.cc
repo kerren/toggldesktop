@@ -6059,7 +6059,7 @@ error Context::me(
 
         std::stringstream ss;
         ss << "/api/"
-           << kAPIV8
+           << kAPIV9
            << "/me"
            << "?app_name=" << TogglClient::Config.AppName
            << "&with_related_data=true";
