@@ -1,11 +1,19 @@
 # Toggl API v9 migration plan
 
 Working reference for finishing the migration of TogglDesktop off the shut-down
-Toggl API v8. Branch: `claude/toggl-api-upgrade-timeline-1k4x06`.
+Toggl API v8, structured for delegation to coding agents.
 
-Status at time of writing: commits `d6f5882` and `c496215` pushed, 71/71 offline
-tests passing, **two of the endpoint changes in `d6f5882` are known to be wrong**
-and are corrected in Phase 0 below.
+Branch: `claude/api-v8-v9-upgrade-436x05`.
+
+**Baseline re-verified in this container on 2026-08-01:**
+
+- `cmake -S . -B build -DTOGGL_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release` → configures clean.
+- `cmake --build build --target TogglDesktopLibrary TogglAppTest` → builds clean.
+- `./src/test/TogglAppTest` → **71 tests from 14 test cases, 71 passed.**
+- No `/api/v8` path, no `kAPIV8`, and no v8-only payload shape remains anywhere in `src/`.
+
+Two of the endpoint changes already on the branch are still known to be wrong and
+are corrected in Phase 0.
 
 ---
 
@@ -31,15 +39,20 @@ app made against v8 has been failing since. v9 is the only version left.
 | `toggl-open-source/toggldesktop` master (2023 snapshot) | reference client behaviour, real server error strings | High |
 | Packet capture supplied by the maintainer | that `/api/v9/timeline` exists on `api.track.toggl.com` | Medium — host/path only |
 | WebSearch snippets (community, blog) | rate limits, shutdown dates | Medium |
+| Direct read of this working tree (2026-08-01) | every code claim, line number and build/test result below | High — verified in container |
 
 The spec's `host` field is a `localhost:8080` placeholder, so it does **not**
 confirm which public host serves any given path. Host choices remain inferred.
+
+`engineering.toggl.com` returns **403** from this container, so the spec cannot be
+re-fetched here. Every spec-derived claim below carries over from the earlier
+session at the trust level shown above; the code claims have all been re-checked.
 
 ---
 
 ## 2. Already done
 
-Commits `d6f5882` and `c496215`:
+Commits `d6f5882` and `c496215` (merged to `master` via PR #1):
 
 - `src/urls.cc` — added `TrackAPI()` (`api.track.toggl.com`, staging
   `api.track.toggl.space`). `API()` and `TimelineUpload()` return it.
@@ -58,7 +71,25 @@ Commits `d6f5882` and `c496215`:
 - Timeline payload reshaped to `app_name`/`window_title` + ISO 8601.
   **Wrong, see 0.1.**
 
-No `/api/v8` path, no `kAPIV8`, and no v8 payload shape remains in `src/`.
+### Verified healthy — do not "fix" these
+
+Re-checked in this working tree; they look wrong at a glance but are correct:
+
+- **`Client::SaveToJSON` sends `wid`, not `workspace_id`** (`src/model/client.cc:60`).
+  v9 genuinely kept the old name for clients. There is already a comment saying so.
+- **The read path is dual-shape by design.** `LoadFromJSON` in `tag.cc:35`,
+  `task.cc:43-49`, `project.cc:111-125`, `client.cc:48-50` and `time_entry.cc:479-481`
+  all branch `isMember("wid") ? v8 : v9` (and `hex_color`/`color`, `pid`/`project_id`,
+  `cid`/`client_id`). Keep both branches — the local SQLite cache still holds
+  v8-shaped rows for existing installs.
+- **`GET /api/v9/me/time_entries?since=` at `src/context.cc:5306`** is already the
+  correct v9 per-collection form. It is the model for fixing 1.1.
+- **`silentGet` / `silentPost`** (`src/https_client.cc:570-580`) already bypass the
+  `ServerStatus` gate by calling `HTTPClient::request` directly. This is the existing
+  mechanism to reuse for 1.2 — the fix is call-site selection, not new plumbing.
+- **The GUI layers hold no API knowledge.** `src/ui/{linux,osx,windows}` contain no
+  `/api/` paths and no Toggl API hosts. The migration is entirely inside the C++ core.
+- **No Reports API usage anywhere.** Nothing to migrate off Reports v2.
 
 ---
 
@@ -79,11 +110,19 @@ That is the **v8 shape**. The endpoint moved to v9; the payload did not. The
 `app_name`/`window_title` + ISO 8601 shape currently on the branch came from a
 conceptual example that explicitly disclaimed its own key names, and is wrong.
 
+Current state confirmed at `src/model/timeline_event.cc:70-97`: the `apiVersion <= 8`
+branch still holds the correct fields, the `else` branch emits the wrong ones, and
+`kTimelineAPIVersion = 9` (`src/timeline_uploader.h:19`) selects the wrong branch.
+
 - Restore `filename`, `title`, `start_time`, `end_time` in
-  `TimelineEvent::SaveToJSON` (`src/model/timeline_event.cc:70`).
-- Add `idle` — a real spec field the client has never sent.
+  `TimelineEvent::SaveToJSON`.
+- Add `idle` — a real spec field the client has never sent. `TimelineEvent::Idle`
+  already exists as a property (`src/model/timeline_event.h:30`) and is simply
+  never serialised.
 - Keep the `/api/v9/timeline` path and keep `desktop_id`.
 - Drop `created_with` and `guid`: neither is in the schema.
+- Collapse the version branch entirely rather than leaving a dead `apiVersion <= 8`
+  arm — there is no v8 to fall back to.
 - Update the tests added in `d6f5882` (`src/test/app_test.cc:1559,1588`).
 
 ### 0.2 Move `record_timeline` to the preferences endpoint (~1h)
@@ -93,7 +132,7 @@ default_workspace_id, email, fullname, password, timezone`. `record_timeline` is
 a property of `models.AllPreferences`, served by `/me/preferences/{client}`.
 There is no `/timeline_settings` path in v9.
 
-- `Context::onTimelineUpdateServerSettings` (`src/context.cc:1838`):
+- `Context::onTimelineUpdateServerSettings` (`src/context.cc:1838-1844`):
   `PUT /api/v9/me` → `POST /api/v9/me/preferences/desktop`.
 - This is the same endpoint the app already *reads* the setting from
   (`src/context.cc:6303`).
@@ -113,13 +152,14 @@ particular is not doing what the code believes — see 1.1.
 - Document that `Client::SaveToJSON` deliberately keeps `wid` — v9 really did
   keep that name for clients. It looks like a bug and will be "fixed" by mistake
   otherwise (`src/model/client.cc:60`).
+- Document the dual-shape read path as intentional (see "Verified healthy" above).
 - Document the `sync.toggl.com` protocol (section 6) or mark it do-not-extend.
 
 ### 0.5 Switch feedback to `/api/v9/feedback` (~1h)
 
 Both `/feedback` and `/feedback/web` exist and both take the multipart form the
-code already builds. `/feedback` additionally carries `device_model`,
-`build_number` and `operating_system` — it is the desktop-shaped one.
+code already builds (`src/context.cc:1944`). `/feedback` additionally carries
+`device_model`, `build_number` and `operating_system` — it is the desktop-shaped one.
 
 ---
 
@@ -129,13 +169,16 @@ code already builds. `/feedback` additionally carries `device_model`,
 
 `/me` returns no top-level `since` or `server_time`, so `User::Since()` never
 advances, `HasValidSinceDate()` stays false, and every sync cycle does a full
-pull (`src/model/user.cc:801-825`, `src/context.cc:5379-5397`).
+pull (`src/model/user.cc:805-813`, `src/context.cc:5389-5391`).
 
 Correct-but-heavy, and heavier requests against a ~1 req/s limit. The real fix
 is per-collection `?since=`, which v9 supports on `/me/time_entries`,
 `/me/workspaces`, `/me/clients` and `/me/preferences/{client}`.
 
 Decision needed: accept full pulls for now, or implement per-collection since.
+**Recommendation: accept full pulls for now**, and do 1.8 (pacing) instead — it
+removes the same pressure for a fraction of the risk. Revisit if users report
+slow sync.
 
 ### 1.2 One 5xx from any endpoint stalls all sync (~4h)
 
@@ -145,7 +188,8 @@ checker, after which every subsequent request short-circuits with
 `kBackendIsDownError` until `GET /api/v9/status` succeeds.
 
 So a single 5xx from a low-traffic endpoint — feedback, timeline — stops time
-entries syncing. Decouple best-effort endpoints from the status gate.
+entries syncing. Decouple best-effort endpoints from the status gate by routing
+them through the existing `silentGet`/`silentPost`, which already skip the gate.
 
 ### 1.3 Timeline events are destroyed after 7 days (~3h)
 
@@ -158,6 +202,11 @@ Pre-existing, but 0.1 is exactly the scenario that triggers it: if uploads are
 rejected, activity data bleeds away weekly and silently. Skip deletion for
 events that have not been uploaded.
 
+Add an upper bound too — an account that can never upload (permanently revoked
+token) would otherwise grow the local DB without limit. Suggest keeping
+un-uploaded events up to a hard ceiling (e.g. 90 days) and logging when the
+ceiling evicts anything.
+
 ### 1.4 No 422 handling (~3h)
 
 `HTTPClient::StatusCodeToError` (`src/https_client.cc:187-230`) handles
@@ -166,12 +215,24 @@ events that have not been uploaded.
 "cannot connect" and retried forever. Confirm which codes v9 uses for validation
 failures, then handle them explicitly.
 
+Fold in the adjacent mapping bug: **429 also returns `kCannotConnectError`**
+(`src/https_client.cc:216`), which `IsNetworkingError` (`src/error.cc:16`) then
+classifies as offline. So hitting the rate limit sets `trigger_sync_ = false`
+(`src/context.cc:5993`) and shows the user a connectivity error for what is
+actually successful throttling. Give 429 its own error constant that is *not* a
+networking error, and let the existing 60s host ban do the backoff.
+
 ### 1.5 `pushEntries` can duplicate entries server-side (~2h)
 
 `Context::pushEntries` (`src/context.cc:6012-6028`) requires `root["id"]` in the
 create response and silently `continue`s if absent, leaving `ID()` at 0 so
 `NeedsPOST()` stays true. If the server *did* create the record, the next cycle
 re-POSTs it — indefinitely. Needs a real create-response to confirm the shape.
+
+Note `TimeEntry::SaveToJSON` already sends `guid` on v9 bodies
+(`src/model/time_entry.cc:547`). If v9 honours `guid` as an idempotency key this
+is already mitigated; if it ignores it, the duplicate risk is live. Settle this
+in Phase 3 before writing the fix.
 
 ### 1.6 `ResolveError` matches hardcoded English v8 error strings (~4h)
 
@@ -181,13 +242,48 @@ be reworded. Conditions that used to self-correct now leave the entry stuck
 unsynced, since `ValidationError` blocks `NeedsPush()`. Capture real v9 error
 bodies and diff.
 
+Independent of what the strings turn out to be, add a **fallback**: an
+unrecognised 4xx body currently pins the entry as permanently unsynced with no
+recovery path and no log line naming the unmatched string. Log the unmatched body
+at warning and cap retries so one bad entry cannot wedge the push queue forever.
+
 ### 1.7 Bare `/tags` and `/tasks` do not exist in v9 (~1h)
 
 `Tag::ModelURL()` (`src/model/tag.cc:45`) and `Task::ModelURL()`
 (`src/model/task.cc:58`) return `/api/v9/tags` and `/api/v9/tasks`. Neither path
 exists — they must be `/api/v9/workspaces/{workspace_id}/tags` and
-`.../tasks`. Dead code today (only clients, projects and time entries are
-pushed), but a trap for whoever wires up tag/task sync.
+`.../tasks`. Dead code today (`pushChanges` only calls `pushClients`,
+`pushProjects` and `pushEntries` — `src/context.cc:5711,5727,5752`), but a trap
+for whoever wires up tag/task sync.
+
+### 1.8 No client-side request pacing (~4h) — *new*
+
+Nothing throttles outbound requests, and the push path issues **one request per
+dirty model** (`src/context.cc:5799,5855,5950`). A sync cycle after offline use
+fires: `/me` + `/me/preferences/desktop` + one `/workspaces/{id}/preferences` per
+*business* workspace (`src/context.cc:6219-6233`) + N client POSTs + N project
+POSTs + N entry POSTs — back to back, against a ~1 req/s limit.
+
+Twenty queued entries is twenty requests in a burst. The server answers 429, the
+client bans the host for 60s (`src/https_client.cc:487`), and — because of the
+429 mapping in 1.4 — reports it as being offline. The user sees sync stop for a
+minute with a connectivity error, then repeat.
+
+Add a minimum inter-request interval in `HTTPClient::request` (a simple
+per-host token bucket at ~1 req/s), and on 429 prefer an incremental backoff over
+the flat 60s ban. Pair with 1.4 — the two together are what make heavy accounts
+usable.
+
+### 1.9 Running-entry duration still uses the v8 encoding (~2h) — *new*
+
+`TimeEntry::SetDurationInSeconds(-start)` (`src/model/time_entry.cc:307,334`)
+encodes a running entry as the **negative epoch start time**, the v8 convention.
+v9 documents running entries as "negative duration, `-1` recommended".
+
+Negative epoch *is* negative, so this most likely still works — but it is an
+untested assumption sitting on the app's single most important write path. Verify
+in Phase 3 before changing anything; if v9 accepts it, document it and move on
+rather than churning the code.
 
 ---
 
@@ -195,11 +291,12 @@ pushed), but a trap for whoever wires up tag/task sync.
 
 ### 2.1 Add a Linux CI job (~3h)
 
-`.github/workflows/main.yml` currently runs Windows GUI builds only; every
-macOS/Linux job is commented out. **No CI builds or tests the C++ core at all** —
-the `wid`/`pid` bug would have shipped undetected.
+`.github/workflows/main.yml` is 587 lines of which every macOS and Linux job is
+commented out (`main.yml:12,121,190,211,269,328,359`); only three
+`windows-2019` GUI jobs run. **No CI builds or tests the C++ core at all** — the
+`wid`/`pid` bug would have shipped undetected.
 
-Proven recipe (verified in this container, 71/71 pass):
+Proven recipe (re-verified in this container 2026-08-01, 71/71 pass):
 
 ```sh
 apt-get install -y qtbase5-dev qtbase5-private-dev libqt5x11extras5-dev \
@@ -207,37 +304,60 @@ apt-get install -y qtbase5-dev qtbase5-private-dev libqt5x11extras5-dev \
   libxmu-dev libxss-dev cmake build-essential pkg-config
 
 cmake -S . -B build -DTOGGL_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target TogglDesktopLibrary TogglAppTest -j4
+cmake --build build --target TogglDesktopLibrary TogglAppTest -j"$(nproc)"
 cd build && ./src/test/TogglAppTest
 ```
 
-Two gotchas worth encoding in the job:
+Three gotchas worth encoding in the job:
 
 - The binary must run with its CWD one level below the repo root; fixtures are
   loaded via relative paths like `../testdata/...` (`src/test/app_test.cc:353`).
 - Qt5 must be *installed* even though neither `TogglDesktopLibrary` nor
   `TogglAppTest` links it, because `find_package(Qt5... REQUIRED)` at
-  `CMakeLists.txt:52-58` is unconditional. Making that conditional would let CI
-  skip Qt entirely.
+  `CMakeLists.txt:52-59` is unconditional. Making that conditional would let CI
+  skip Qt entirely and cut several minutes off the job.
+- Build only the two named targets. `TOGGL_BUILD_TESTS=ON` also defines
+  `TogglApiTest` and `TogglOnlineTest` (`src/test/CMakeLists.txt`), both of which
+  make live network calls — see 2.3.
 
 Build against **system** Poco/OpenSSL/jsoncpp, not the vendored copies.
 
 ### 2.2 Add a v9 `/me` fixture (~2h)
 
-`testdata/me.json` is a v8 `{"since":…, "data":{…}}` envelope feeding ~50+ tests,
-so the suite exercises the *fallback* branch of every `isMember("wid") ? … : …`
-check and never the v9 branch. Nothing currently proves a real v9 login response
-parses. Add `testdata/me_v9.json` — flat, `workspace_id`/`project_id`/
-`client_id`/`task_id` throughout, `default_workspace_id`, no wrapper.
+`testdata/me.json` is a v8 `{"since":…, "data":{…}}` envelope with `default_wid`,
+feeding ~50+ tests, so the suite exercises the *fallback* branch of every
+`isMember("wid") ? … : …` check and never the v9 branch. Nothing currently proves
+a real v9 login response parses.
+
+Add `testdata/me_v9.json` — flat, no wrapper, no `since`. It must exercise **all**
+of the dual-shape forks listed under "Verified healthy", or it proves less than it
+appears to:
+
+| File | v8 key | v9 key |
+| --- | --- | --- |
+| `user.cc` | `default_wid` | `default_workspace_id` |
+| `time_entry.cc:479` | `wid` | `workspace_id` |
+| `project.cc:111,119,123` | `hex_color`, `wid`, `cid` | `color`, `workspace_id`, `client_id` |
+| `task.cc:43,47` | `pid`, `wid` | `project_id`, `workspace_id` |
+| `client.cc:48` | `wid` | `workspace_id` |
+| `tag.cc:35` | `wid` | `workspace_id` |
+
+Strongest acceptance test: a **parity test** that loads `me.json` and `me_v9.json`
+into two `User` objects and asserts the resulting model state is identical field
+for field. That pins both branches against each other and will catch a
+half-migrated read path.
 
 ### 2.3 Stop `TogglApiTest` making live network calls (~1h)
 
-`urls::requests_allowed_` defaults to true and is only changed by
-`Context::SetEnvironment` (`src/context.cc:2399`), which the test harness never
-calls. So `toggl_login`, `toggl_sync`, `toggl_add_project` and friends
-(`src/test/toggl_api_test.cc:848-996`) issue **real** HTTP requests to staging
-with throwaway credentials. One-line fix: set the environment to `test` in the
-fixture. Do not add `TogglApiTest` to CI before this is fixed.
+`urls::requests_allowed_` defaults to true (`src/urls.cc:21`) and is only changed
+by `Context::SetEnvironment` (`src/context.cc:2399`), which the `testing::App`
+fixture (`src/test/toggl_api_test.cc:304-324`) never calls. So `toggl_login`,
+`toggl_sync`, `toggl_add_project` and friends (`src/test/toggl_api_test.cc:848-996`)
+issue **real** HTTP requests to staging with throwaway credentials.
+
+One-line fix: call `toggl_set_environment(ctx_, STR("test"))` in the fixture
+constructor — `TEST(toggl_api, toggl_set_environment)` at line 718 already proves
+the call works. Do not add `TogglApiTest` to CI before this is fixed.
 
 ### 2.4 Add an HTTP mock seam (~1d)
 
@@ -245,6 +365,11 @@ fixture. Do not add `TogglApiTest` to CI before this is fixed.
 can capture the outgoing request (assert the URL is `/api/v9/...` and the payload
 field names are right) and inject canned v9 responses. This is what would have
 caught both the `wid`/`pid` bug and the timeline payload error.
+
+Minimum coverage once the seam exists — one assertion per shape this migration
+got wrong or could get wrong: time entry create/update body, project create body,
+client create body (asserting `wid`, not `workspace_id`), timeline upload body,
+and the preferences POST from 0.2.
 
 ### 2.5 Fix logging (~3h)
 
@@ -257,11 +382,64 @@ caught both the `wid`/`pid` bug and the timeline payload error.
 - The `Authorization` header is already stripped before logging
   (`src/https_client.cc:419`). Keep it that way; note that feedback submissions
   attach the raw log file (`src/context.cc:1929`), so anything logged reaches
-  support.
+  support. Redact `api_token` out of logged bodies before enabling body logging —
+  `/me` responses contain it.
 
 ---
 
-## 6. Open question: is `sync.toggl.com` still alive?
+## 6. Phase 2b — dead non-Toggl integrations *(new section)*
+
+Not API v8, but equally "the app calls a service that no longer exists". In scope
+for *"upgrade this project fully so that it still works"*.
+
+### 2b.1 Google Analytics is dead (~4h)
+
+`src/analytics.cc:142-178` builds Universal Analytics hits:
+
+```
+https://ssl.google-analytics.com/collect?v=1&tid=UA-3215787-27&cid=…&t=event…
+```
+
+Universal Analytics stopped processing data on 2023-07-01; `v=1` hits against a
+`UA-` property are discarded. All **31 call sites** in `src/context.cc` are
+firing into a void.
+
+Mitigating detail: these go through `silentGet` (`src/analytics.cc:161,328`),
+which bypasses the `ServerStatus` gate — so unlike 1.2, dead analytics does *not*
+stall sync. This is a correctness/cleanliness item, not an outage.
+
+Also note `tid=UA-3215787-27` is **Toggl's own property**. A fork cannot send to
+it and should not try.
+
+**Recommendation: gut the implementation, keep the interface.** Make the
+`runTask()`/`makeReq()` bodies no-ops (or drop the HTTP call and keep a debug log
+line) so all 31 `analytics_.Track*` call sites in `context.cc` compile unchanged.
+That contains the whole change to `src/analytics.{cc,h}` and keeps this slice off
+the `context.cc` contention path. Deleting the call sites is a larger, riskier
+diff for no additional benefit.
+
+### 2b.2 Update check points at an archived upstream (~3h)
+
+Two independent update paths, both aimed at the discontinued upstream project:
+
+- `src/context.cc:1462-1463` — `https://toggl.github.io/toggldesktop/assets/updates-link.txt`,
+  then follows whatever URL that returns.
+- `src/context.cc:1606-1612` — `https://raw.githubusercontent.com/toggl-open-source/toggldesktop/{master,mac-deprecation-message}/releases/message.json`.
+
+For this fork these are at best stale and at worst will surface an upstream
+deprecation notice to users of a maintained fork. Decide: disable the in-app
+update check, or repoint at this fork's own release metadata. Whichever is chosen,
+it must fail closed and silently — `UpdateChannel` errors currently reach the UI.
+
+### 2b.3 Trivia (~30m)
+
+- `.travis.yml` is dead config for a CI service the project no longer uses.
+- The root `Makefile` is a dead macOS-only build path superseded by CMake
+  (see section 9).
+
+---
+
+## 7. Open question: is `sync.toggl.com` still alive?
 
 There is a **second sync protocol** — `Context::pullBatchedUserData` /
 `pushBatchedChanges` (`src/context.cc:5450-5622`) — talking to `urls::SyncAPI()`
@@ -280,13 +458,15 @@ it as live and do not delete it.
 
 Note: `SyncPayload()`/`SyncMetadata()` are hand-built and independent of
 `SaveToJSON()`, so the Phase 0 and `c496215` changes do not affect this path.
+`Sync.LegacyFormat` and `Sync.BatchedFormat` in `TogglAppTest` cover it offline
+and must keep passing.
 
 ---
 
-## 7. Phase 3 — live verification (requires a real API token)
+## 8. Phase 3 — live verification (requires a real API token)
 
-Cannot be done from the dev container: egress blocks all `toggl.com` hosts.
-Roughly in priority order:
+Cannot be done from the dev container: egress blocks `toggl.com` hosts, and
+`engineering.toggl.com` returns 403. Roughly in priority order:
 
 1. `POST /api/v9/timeline` with the corrected payload — which **host** serves it
    (`api.track.toggl.com` vs `desktop.track.toggl.com`) and does it return 2xx.
@@ -299,31 +479,30 @@ Roughly in priority order:
 4. Does `api.track.toggl.space` resolve and serve? It is a guess. If wrong, all
    staging verification is silently broken from the start.
 5. Capture a real `POST .../time_entries` create response; diff against what
-   `pushEntries` expects (see 1.5).
+   `pushEntries` expects, and check whether `guid` is honoured as an idempotency
+   key (see 1.5).
 6. Capture 2-3 real v9 error bodies; diff against `time_entry.cc`/`error.cc`
    (see 1.6).
-7. `desktop.track.toggl.com/stream` still accepts the websocket upgrade. Failure
-   is silent and permanent: it retries every 45s forever and degrades to ~15-30
-   minute polling with no user-visible error.
+7. Start a timer and confirm v9 accepts a **negative-epoch** duration, not just
+   `-1` (see 1.9).
+8. Does `GET /me?with_related_data=true` return the full time-entry history or a
+   bounded window? v8 returned everything. If v9 bounds it, first sync after login
+   shows fewer entries than users expect, and 1.1 stops being optional.
+9. Confirm the observed 429 threshold and whether any `Retry-After`-equivalent
+   header is sent — sizes the token bucket in 1.8.
+10. `desktop.track.toggl.com/stream` still accepts the websocket upgrade
+    (`src/websocket_client.cc:125`). Failure is silent and permanent: it retries
+    every 45s forever and degrades to ~15-30 minute polling with no user-visible
+    error.
 
-`src/test/online_test.cc` is an existing live end-to-end suite (signs up a
-throwaway user, creates entries and projects) that nothing currently runs. It is
-the cheapest way to cover most of the above. It has no production guard — do not
-build it with `TOGGL_PRODUCTION_BUILD=ON`.
+`src/test/online_test.cc` is an existing live end-to-end suite (23 tests; signs up
+a throwaway user, creates entries and projects) that nothing currently runs. It is
+the cheapest way to cover most of the above. It has **no production guard** —
+verified: no `TOGGL_PRODUCTION_BUILD` check and no environment pinning anywhere in
+`online_test.cc` or `online_test_app.cpp`. Do not build it with
+`TOGGL_PRODUCTION_BUILD=ON`.
 
 ---
-
-## 8. Sequencing
-
-1. **Phase 0** — known-wrong code, do first.
-2. **2.1 + 2.2** — get CI and a v9 fixture under the work before changing more.
-3. **Phase 1** — in numbered order; 1.2 and 1.3 are the ones with user-visible
-   blast radius.
-4. **2.3 – 2.5** — as capacity allows.
-5. **Phase 3** — gates the release.
-
-Rough totals: ~2 days for Phase 0 + 2.1 + 2.2; ~3 days for Phase 1; Phase 3 is
-maintainer time, not engineering time.
 
 ## 9. Explicitly not worth doing
 
@@ -333,6 +512,209 @@ maintainer time, not engineering time.
   vendored Poco to C++11 because it uses features removed in C++17.
 - **The root `Makefile`.** A dead macOS-only build path superseded by CMake.
   Delete it in a separate cleanup rather than maintaining it.
+- **Removing the dual-shape read path.** It looks like migration debt but it is
+  load-bearing for existing local databases. See "Verified healthy".
+- **Deleting the 31 `analytics_.Track*` call sites.** Gut the implementation
+  instead — see 2b.1.
+
+---
+
+# 10. Development approach — agent-delegable workstreams
+
+## 10.1 The rule that makes parallelism safe
+
+`src/context.cc` is ~7000 lines and is touched by most of this work. It is the
+only real merge-conflict risk in the repo.
+
+> **Treat `src/context.cc` as a mutex: at most one in-flight workstream may own it
+> at a time.** Every wave below is built around that constraint.
+
+Secondary shared files, same rule per wave: `src/https_client.cc`,
+`src/model/user.cc`, `src/test/app_test.cc`.
+
+## 10.2 Definition of done — applies to every workstream
+
+An agent's slice is not complete until all of these hold:
+
+1. `cmake --build build --target TogglDesktopLibrary TogglAppTest -j"$(nproc)"` succeeds.
+2. `cd build && ./src/test/TogglAppTest` reports **≥71 passed, 0 failed**. The
+   count only goes up.
+3. No new compiler warnings introduced.
+4. `grep -rn "api/v8\|kAPIV8" src/` returns nothing.
+5. Only files inside the slice's declared ownership were modified (`git diff --name-only`).
+6. One commit per slice, message prefixed with the slice ID (e.g. `W1-A: …`).
+7. Anything the agent could not verify without a live token is written into
+   section 8 of this file rather than guessed at.
+
+## 10.3 Wave plan
+
+```
+W0  Foundation ─────────────────────────────────► (blocks everything)
+     │
+     ├─ W1-A Timeline data path        ┐
+     ├─ W1-B Account/prefs endpoints   ├─ parallel, disjoint files
+     └─ W1-C Model URLs & payloads     ┘
+          │
+          ├─ W2-D Networking layer     ┐
+          └─ W2-E Dead integrations    ┴─ parallel
+               │
+               ├─ W3-F Mock seam & push tests  ┐
+               └─ W3-G Error strings & docs    ┴─ parallel
+                    │
+                    └─ W4 Live verification (maintainer + 1 agent)
+```
+
+---
+
+### W0 — Test & CI foundation · 1 agent · ~1 day · **blocks all**
+
+Nothing else should start until CI is green, because W0 defines the gate every
+later slice is measured against.
+
+**Covers:** 2.1, 2.2, 2.3
+**Owns:** `.github/workflows/`, `testdata/me_v9.json`, `src/test/app_test.cc`,
+`src/test/toggl_api_test.cc`, `CMakeLists.txt` (Qt guard only)
+**Must not touch:** anything under `src/model/`, `src/context.cc`, `src/https_client.*`
+
+Deliverables:
+- Linux CI job running the verified recipe in 2.1, on push and PR.
+- `testdata/me_v9.json` covering every fork in the 2.2 table.
+- The v8/v9 parity test from 2.2.
+- `toggl_set_environment(ctx_, STR("test"))` in the `testing::App` fixture, plus a
+  check that no test issues live requests.
+
+**Why first:** it is pure additive infrastructure — it cannot break the app, and
+every later agent needs `TogglAppTest` as its acceptance signal.
+
+---
+
+### W1 — Correctness · 3 agents in parallel · ~1 day each
+
+Three disjoint file sets. `context.cc` is held by W1-B alone.
+
+#### W1-A · Timeline data path
+**Covers:** 0.1, 1.3
+**Owns:** `src/model/timeline_event.{cc,h}`, `src/model/user.cc`,
+`src/timeline_uploader.{cc,h}`, timeline tests in `src/test/app_test.cc`
+**Key risk:** the payload revert is a *revert* — the correct shape is already in
+the repo in the `apiVersion <= 8` branch. Do not re-derive it.
+
+#### W1-B · Account & preferences endpoints
+**Covers:** 0.2, 0.3, 0.5
+**Owns:** `src/context.cc` (exclusively for this wave)
+**Key risk:** 0.2 changes both the URL *and* the HTTP verb (`Put` → `Post`). The
+existing `kRecordTimelineEnabledJSON`/`DisabledJSON` body constants may need
+reshaping for the preferences schema — check against the read path at
+`src/context.cc:6303` which already parses that endpoint's response.
+
+#### W1-C · Model URLs & payload shapes
+**Covers:** 1.7, 1.9 (investigate + document only), 0.4's `Client::wid` note
+**Owns:** `src/model/{tag,task,time_entry,client,project}.cc` and their headers
+**Key risk:** `Tag`/`Task` `ModelURL()` need a workspace ID that the current
+signature does not carry — check `Client::ModelURL()` (`src/model/client.cc:16`)
+for the established pattern. **Do not change the running-entry encoding (1.9)
+without live verification** — document the finding and stop.
+
+---
+
+### W2 — Resilience · 2 agents in parallel · ~1 day each
+
+#### W2-D · Networking layer
+**Covers:** 1.2, 1.4, 1.8, and the request-body half of 2.5
+**Owns:** `src/https_client.{cc,h}`, `src/error.cc`, `src/const.h`
+**Key risk:** 1.2's fix is call-site routing through the existing
+`silentGet`/`silentPost`, but those call sites are in `context.cc` — which W2-E
+owns this wave. Add the mechanism here; hand the call-site list to W2-E, or defer
+the routing to W3.
+**Watch:** changing the 429 mapping (1.4) affects `IsNetworkingError`, which gates
+`trigger_sync_`. Confirm `Sync.LegacyFormat` and `Sync.BatchedFormat` still pass.
+
+#### W2-E · Dead third-party integrations
+**Covers:** 2b.1, 2b.2, 2b.3, and the `std::cerr` half of 2.5
+**Owns:** `src/analytics.{cc,h}`, `src/context.cc`, `.travis.yml`
+**Key risk:** keep the `Analytics` public interface intact so the 31 call sites in
+`context.cc` compile untouched — see 2b.1. 2b.2 needs a product decision (disable
+vs repoint); if unanswered, implement "disable, fail silent" and flag it.
+
+---
+
+### W3 — Verification depth · 2 agents in parallel · ~1 day each
+
+#### W3-F · Mock seam & push-path tests
+**Covers:** 2.4, and 1.5 *if* Phase 3 item 5 has been answered
+**Owns:** `src/https_client.h` (test hook), `src/test/`, `src/context.cc`
+**Key risk:** the seam must not change production behaviour. Gate it so a release
+build has no test hook active.
+
+#### W3-G · Error-string resilience & docs
+**Covers:** 1.6 (the fallback half — the string half waits on Phase 3), 0.4
+**Owns:** `src/model/time_entry.cc`, `src/error.cc`, `docs/lib/api.md`
+**Key risk:** do not guess at v9 error strings. Build the retry cap and the
+warning log for unmatched bodies; leave the string table alone until item 6 of
+Phase 3 lands.
+
+---
+
+### W4 — Live verification · maintainer-gated
+
+Section 8 in full. One agent can prepare the ground — wire `TogglOnlineTest` into
+a manually-triggered CI job with a token from repository secrets, and add the
+production guard it currently lacks — but the runs and the judgement calls need a
+maintainer with a real account.
+
+**This wave gates release.** 1.5, 1.6 and 1.9 cannot be closed without it.
+
+---
+
+## 10.4 What runs sequentially and why
+
+Sequencing is driven by file ownership, not by technical dependency — most of
+these slices are logically independent. The waves exist so that parallel agents
+never contend for `context.cc`, `https_client.cc`, `user.cc` or `app_test.cc`.
+
+If you would rather run everything with a single agent, the order is:
+**W0 → W1-A → W1-B → W1-C → W2-D → W2-E → W3-F → W3-G → W4.** No wave boundary
+carries a hidden dependency; the only hard gate is W0 before everything else.
+
+## 10.5 Briefing template for an agent
+
+Give each agent this, filled in from the slice above:
+
+```
+You are implementing slice <ID> of the Toggl API v9 migration.
+
+Read plan.md in the repo root first — it is the source of truth.
+Your slice is section <ID> of plan.md §10.3. Implement exactly the items
+listed under "Covers"; do not do work belonging to other slices.
+
+File ownership: you may modify ONLY <owned paths>. If you believe a change
+outside that set is required, stop and report it instead of making it.
+
+Definition of done: plan.md §10.2, all seven points.
+
+Build/test:
+  cmake -S . -B build -DTOGGL_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+  cmake --build build --target TogglDesktopLibrary TogglAppTest -j"$(nproc)"
+  cd build && ./src/test/TogglAppTest       # must report >=71 passed, 0 failed
+
+Anything you cannot verify without a live Toggl API token: do not guess.
+Append it to plan.md §8 with what you would test and why it matters.
+
+Commit as "<ID>: <summary>" on branch claude/api-v8-v9-upgrade-436x05.
+```
+
+## 10.6 Effort summary
+
+| Wave | Slices | Parallel? | Elapsed (parallel) | Total agent-days |
+| --- | --- | --- | --- | --- |
+| W0 | 1 | — | 1d | 1.0 |
+| W1 | A, B, C | yes (3) | 1d | 2.5 |
+| W2 | D, E | yes (2) | 1d | 2.0 |
+| W3 | F, G | yes (2) | 1d | 1.5 |
+| W4 | live | maintainer | — | 0.5 + maintainer time |
+| | | | **~4 days** | **~7.5 agent-days** |
+
+Fully sequential, the same work is ~7-8 days elapsed.
 
 ---
 
@@ -343,11 +725,11 @@ maintainer time, not engineering time.
 | `GET /api/v9/me` | Correct. Only param is `with_related_data`; returns a flat user object; related collections are clients, projects, tags, tasks, time_entries, workspaces. No `since`/`server_time` in response. |
 | `PUT /api/v9/me` | Exists, but **cannot** set `record_timeline`. |
 | `GET/POST /api/v9/me/preferences/{client}` | Correct; `client` is `desktop` or `web`. Carries `record_timeline`. |
-| `GET /api/v9/me/time_entries` | Correct. Supports `since`, `before`, `start_date`, `end_date`. |
+| `GET /api/v9/me/time_entries` | Correct. Supports `since`, `before`, `start_date`, `end_date`. Already used correctly at `context.cc:5306`. |
 | `GET /api/v9/me/workspaces` | Correct. |
 | `POST /api/v9/me/accept_tos` | Correct. |
 | `GET/POST /api/v9/workspaces/{id}/preferences` | Correct. |
-| `POST/PUT/DELETE /api/v9/workspaces/{id}/time_entries[/{id}]` | Correct. `created_with` and `workspace_id` required in body. Running entry duration should be negative; `-1` is recommended, not mandatory. |
+| `POST/PUT/DELETE /api/v9/workspaces/{id}/time_entries[/{id}]` | Correct. `created_with` and `workspace_id` required in body — both present. Running entry duration should be negative; `-1` is recommended, not mandatory (see 1.9). |
 | `POST/PUT/DELETE /api/v9/workspaces/{id}/projects[/{id}]` | Correct. |
 | `POST/PUT/DELETE /api/v9/workspaces/{id}/clients[/{id}]` | Correct. Client workspace field is still `wid`. |
 | `/api/v9/tags`, `/api/v9/tasks` | **Wrong** — must be workspace-scoped. |
@@ -357,4 +739,8 @@ maintainer time, not engineering time.
 | `GET /api/v9/status`, `POST /api/v9/signup`, `GET /api/v9/countries` | Correct. |
 | `POST /api/v9/me/enable_sso` | Correct. |
 | `GET /api/v9/auth/saml2/login` | Correct as **GET** with query params — which is what the code already does. |
-| Reports API | v2 is gone; only `/reports/api/v3/...` exists. Not currently used by this app. |
+| Reports API | v2 is gone; only `/reports/api/v3/...` exists. Not used by this app. |
+| `sync.toggl.com` `GET /pull`, `POST /push/{uuid}` | Outside `/api/v9`. Liveness unknown — see section 7. |
+| `ssl.google-analytics.com/collect?v=1&tid=UA-…` | **Dead** — Universal Analytics shut down 2023-07-01. See 2b.1. |
+| `toggl.github.io/toggldesktop/assets/updates-link.txt` | Archived upstream. See 2b.2. |
+| `raw.githubusercontent.com/toggl-open-source/toggldesktop/…` | Archived upstream. See 2b.2. |
