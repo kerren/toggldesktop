@@ -124,7 +124,7 @@
 #define kAutocompleteItemWorkspace 3
 
 #define kTogglDesktopClientID_MacOS "toggldesktop.TogglDesktop"
-#define kAPIV8 "v8"
+// API v8 was shut down by Toggl on 2024-05-23, v9 is the only version left
 #define kAPIV9 "v9"
 #define kGoogleProvider "google"
 #define kAppleProvider "apple"

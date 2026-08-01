@@ -36,10 +36,10 @@ std::string Main() {
 }
 
 std::string API() {
-    if (use_staging_as_backend) {
-        return "https://desktop.track.toggl.space";
-    }
-    return "https://desktop.track.toggl.com";
+    // The desktop-specific host (desktop.track.toggl.*) was only ever needed
+    // for the v8 API. Everything the app calls today lives under /api/v9 on
+    // the public API host.
+    return TrackAPI();
 }
 
 std::string SyncAPI() {
@@ -49,11 +49,17 @@ std::string SyncAPI() {
     return "https://sync.toggl.com/";
 }
 
-std::string TimelineUpload() {
+std::string TrackAPI() {
     if (use_staging_as_backend) {
-        return "https://desktop.track.toggl.space";
+        return "https://api.track.toggl.space";
     }
-    return "https://desktop.track.toggl.com";
+    return "https://api.track.toggl.com";
+}
+
+std::string TimelineUpload() {
+    // The timeline endpoint lives on the main API host since the v8 shutdown,
+    // not on the desktop-specific one.
+    return TrackAPI();
 }
 
 std::string WebSocket() {

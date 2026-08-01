@@ -21,6 +21,11 @@ _Will add flow charts here to describe the usual event flows_
 
 Files in the library are described in depth in the following page [Files in the library](files.md)
 
+## Toggl API
+
+The backend hosts, the API v9 endpoints the library talks to and the timeline
+upload payload are described in [Toggl API usage](api.md)
+
 ## Third party libraries used
 
 ### Poco

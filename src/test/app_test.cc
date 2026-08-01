@@ -1516,8 +1516,10 @@ TEST(JSON, ConvertTimelineToJSON) {
         const Json::Value v = root[0];
         ASSERT_EQ("timeline", v["created_with"].asString());
         ASSERT_EQ(desktop_id, v["desktop_id"].asString());
-        ASSERT_EQ(event.Start(), v["start_time"].asUInt());
-        ASSERT_EQ(event.EndTime(), v["end_time"].asUInt());
+        ASSERT_EQ(Formatter::Format8601(event.Start()),
+                  v["start"].asString());
+        ASSERT_EQ(Formatter::Format8601(event.EndTime()),
+                  v["end"].asString());
     }
 
     event.SetIdle(false);
@@ -1532,10 +1534,12 @@ TEST(JSON, ConvertTimelineToJSON) {
         const Json::Value v = root[0];
         ASSERT_EQ("timeline", v["created_with"].asString());
         ASSERT_EQ(desktop_id, v["desktop_id"].asString());
-        ASSERT_EQ(event.Start(), v["start_time"].asUInt());
-        ASSERT_EQ(event.EndTime(), v["end_time"].asUInt());
-        ASSERT_EQ(event.Filename(), v["filename"].asString());
-        ASSERT_EQ(event.Title(), v["title"].asString());
+        ASSERT_EQ(Formatter::Format8601(event.Start()),
+                  v["start"].asString());
+        ASSERT_EQ(Formatter::Format8601(event.EndTime()),
+                  v["end"].asString());
+        ASSERT_EQ(event.Filename(), v["app_name"].asString());
+        ASSERT_EQ(event.Title(), v["window_title"].asString());
     }
 
     event.SetTitle("Õhtu jõuab, päev veereb {\"\b\t");
@@ -1548,8 +1552,60 @@ TEST(JSON, ConvertTimelineToJSON) {
         ASSERT_EQ(std::size_t(1), root.size());
 
         const Json::Value v = root[0];
-        ASSERT_EQ(event.Title(), v["title"].asString());
+        ASSERT_EQ(event.Title(), v["window_title"].asString());
     }
+}
+
+TEST(JSON, ConvertTimelineToJSONUsesISO8601UTCTimestamps) {
+    const std::string desktop_id("12345");
+
+    TimelineEvent event;
+    event.SetStartTime(1469484000);  // 2016-07-25T22:00:00Z
+    event.SetEndTime(1469484060);    // 2016-07-25T22:01:00Z
+    event.SetFilename("Google Chrome");
+    event.SetTitle("Wireshark Packet Analysis - Stack Overflow");
+
+    std::vector<const TimelineEvent*> list;
+    list.push_back(&event);
+
+    Json::Value root = jsonStringToValue(
+        convertTimelineToJSON(list, desktop_id));
+    ASSERT_EQ(std::size_t(1), root.size());
+
+    const Json::Value v = root[0];
+    ASSERT_EQ("2016-07-25T22:00:00Z", v["start"].asString());
+    ASSERT_EQ("2016-07-25T22:01:00Z", v["end"].asString());
+    ASSERT_EQ("Google Chrome", v["app_name"].asString());
+    ASSERT_EQ("Wireshark Packet Analysis - Stack Overflow",
+              v["window_title"].asString());
+    // v8 field names must be gone
+    ASSERT_FALSE(v.isMember("start_time"));
+    ASSERT_FALSE(v.isMember("end_time"));
+    ASSERT_FALSE(v.isMember("filename"));
+    ASSERT_FALSE(v.isMember("title"));
+}
+
+TEST(JSON, ConvertTimelineToJSONLegacyV8) {
+    const std::string desktop_id("12345");
+
+    TimelineEvent event;
+    event.SetStartTime(time(0) - 10);
+    event.SetEndTime(time(0));
+    event.SetFilename("Is this the real life?");
+    event.SetTitle("Is this just fantasy?");
+
+    std::vector<const TimelineEvent*> list;
+    list.push_back(&event);
+
+    Json::Value root = jsonStringToValue(
+        convertTimelineToJSON(list, desktop_id, 8));
+    ASSERT_EQ(std::size_t(1), root.size());
+
+    const Json::Value v = root[0];
+    ASSERT_EQ(event.Start(), v["start_time"].asUInt());
+    ASSERT_EQ(event.EndTime(), v["end_time"].asUInt());
+    ASSERT_EQ(event.Filename(), v["filename"].asString());
+    ASSERT_EQ(event.Title(), v["title"].asString());
 }
 
 TEST(JSON, Tag) {
@@ -1656,6 +1712,44 @@ TEST(JSON, TimeEntry) {
     ASSERT_EQ(t.Description(), t2.Description());
     ASSERT_EQ(t.Tags(), t2.Tags());
     ASSERT_EQ(t.DurOnly(), t2.DurOnly());
+}
+
+// Models are pushed to /api/v9 URLs, so the default payload must use the v9
+// field names. The v8 names are only reachable by asking for them explicitly.
+TEST(JSON, TimeEntrySaveToJSONDefaultsToV9) {
+    TimeEntry t;
+    t.SetWID(123456789);
+    t.SetPID(2567324, false);
+    t.SetTID(9876543, false);
+
+    const Json::Value v9 = t.SaveToJSON();
+    ASSERT_EQ(Poco::UInt64(123456789), v9["workspace_id"].asUInt64());
+    ASSERT_EQ(Poco::UInt64(2567324), v9["project_id"].asUInt64());
+    ASSERT_EQ(Poco::UInt64(9876543), v9["task_id"].asUInt64());
+    ASSERT_FALSE(v9.isMember("wid"));
+    ASSERT_FALSE(v9.isMember("pid"));
+    ASSERT_FALSE(v9.isMember("tid"));
+
+    const Json::Value v8 = t.SaveToJSON(8);
+    ASSERT_EQ(Poco::UInt64(123456789), v8["wid"].asUInt64());
+    ASSERT_EQ(Poco::UInt64(2567324), v8["pid"].asUInt64());
+    ASSERT_EQ(Poco::UInt64(9876543), v8["tid"].asUInt64());
+}
+
+TEST(JSON, ProjectSaveToJSONDefaultsToV9) {
+    Project p;
+    p.SetWID(123456789);
+    p.SetCID(878318);
+
+    const Json::Value v9 = p.SaveToJSON();
+    ASSERT_EQ(Poco::UInt64(123456789), v9["workspace_id"].asUInt64());
+    ASSERT_EQ(Poco::UInt64(878318), v9["client_id"].asUInt64());
+    ASSERT_FALSE(v9.isMember("wid"));
+    ASSERT_FALSE(v9.isMember("cid"));
+
+    const Json::Value v8 = p.SaveToJSON(8);
+    ASSERT_EQ(Poco::UInt64(123456789), v8["wid"].asUInt64());
+    ASSERT_EQ(Poco::UInt64(878318), v8["cid"].asUInt64());
 }
 
 TEST(User, TimeOfDayFormat) {
