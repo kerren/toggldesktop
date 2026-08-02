@@ -48,6 +48,7 @@ set(APP_TEST_SOURCE_FILES
     test_data.cc
     app_test.cc
     http_seam_test.cc
+    websocket_client_test.cc
 )
 add_executable(TogglAppTest ${APP_TEST_SOURCE_FILES})
 # PocoNet is listed explicitly: http_seam_test.cc drives a real Context, whose

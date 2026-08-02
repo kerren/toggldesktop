@@ -125,6 +125,9 @@ class TOGGL_INTERNAL_EXPORT Context : public TimelineDatasource {
     // Load model update from JSON string (from WebSocket)
     error LoadUpdateFromJSONString(const std::string &json);
 
+    // Pull from the API because the WebSocket announced a change upstream
+    void SyncFromWebSocket();
+
     void SetWebSocketClientURL(const std::string &value);
 
     error SetDBPath(const std::string &path);
@@ -633,6 +636,7 @@ class TOGGL_INTERNAL_EXPORT Context : public TimelineDatasource {
     // timer_ callbacks
     void onSwitchWebSocketOff(Poco::Util::TimerTask& task);  // NOLINT
     void onSwitchWebSocketOn(Poco::Util::TimerTask& task);  // NOLINT
+    void onWebSocketSync(Poco::Util::TimerTask& task);  // NOLINT
     void onSwitchTimelineOff(Poco::Util::TimerTask& task);  // NOLINT
     void onSwitchTimelineOn(Poco::Util::TimerTask& task);  // NOLINT
     void onFetchUpdates(Poco::Util::TimerTask& task);  // NOLINT
@@ -829,6 +833,9 @@ class TOGGL_INTERNAL_EXPORT Context : public TimelineDatasource {
 
     Poco::Int64 last_sync_started_;
     Poco::Int64 sync_interval_seconds_;
+    // Guarded by timer_m_. Coalesces a burst of WebSocket events into a
+    // single pull.
+    bool websocket_sync_scheduled_;
     Poco::Int64 last_tracking_reminder_time_;
     Poco::Int64 last_pomodoro_reminder_time_;
     Poco::Int64 last_pomodoro_break_reminder_time_;
@@ -904,6 +911,9 @@ class TOGGL_INTERNAL_EXPORT Context : public TimelineDatasource {
 void on_websocket_message(
     void *context,
     std::string json);
+
+void on_websocket_sync(
+    void *context);
 
 }  // namespace toggl
 

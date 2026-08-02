@@ -63,10 +63,18 @@ std::string TimelineUpload() {
 }
 
 std::string WebSocket() {
+    // Full websocket URL, path included -- WebSocketClient takes the host,
+    // port and request path from this URI.
+    //
+    // The old v8-era endpoint was desktop.track.toggl.com/stream. That host
+    // died with v8 and now rejects the upgrade ("Cannot upgrade to WebSocket
+    // connection"), which left the app with no push channel at all and a
+    // 15-30 minute polling lag. The live endpoint is /websockets on the main
+    // Track host.
     if (use_staging_as_backend) {
-        return "https://desktop.track.toggl.space";
+        return "wss://track.toggl.space/websockets";
     }
-    return "https://desktop.track.toggl.com";
+    return "wss://track.toggl.com/websockets";
 }
 
 bool ImATeapot() {
