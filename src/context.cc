@@ -76,6 +76,7 @@ Context::Context(const std::string &app_name, const std::string &app_version)
 , idle_(&ui_)
 , last_sync_started_(0)
 , sync_interval_seconds_(0)
+, websocket_sync_scheduled_(false)
 , update_check_disabled_(UPDATE_CHECK_DISABLED)
 , trigger_sync_(false)
 , trigger_push_(false)
@@ -1196,6 +1197,39 @@ error Context::LoadUpdateFromJSONString(const std::string &json) {
     return displayError(save(false));
 }
 
+void Context::SyncFromWebSocket() {
+    // The endpoint announces that something changed without sending the
+    // record, so the reaction is an ordinary pull. Events arrive in bursts
+    // (one edit in the web app can produce several), hence the trailing
+    // debounce: the first event schedules the pull, the rest fold into it.
+    // Dropping events outright would be wrong -- one arriving just after a
+    // sync would then wait out the whole 15-30 minute periodic interval.
+    Poco::Mutex::ScopedLock lock(timer_m_);
+
+    if (websocket_sync_scheduled_) {
+        return;
+    }
+    websocket_sync_scheduled_ = true;
+
+    Poco::Util::TimerTask::Ptr ptask =
+        new Poco::Util::TimerTaskAdapter<Context>(
+            *this, &Context::onWebSocketSync);
+
+    timer_.schedule(ptask, Poco::Timestamp()
+                    + (kWebSocketSyncDebounceSeconds * kOneSecondInMicros));
+}
+
+void Context::onWebSocketSync(Poco::Util::TimerTask&) {  // NOLINT
+    logger.debug("onWebSocketSync");
+
+    {
+        Poco::Mutex::ScopedLock lock(timer_m_);
+        websocket_sync_scheduled_ = false;
+    }
+
+    Sync();
+}
+
 void Context::switchWebSocketOn() {
     logger.debug("switchWebSocketOn");
 
@@ -1226,7 +1260,8 @@ void Context::onSwitchWebSocketOn(Poco::Util::TimerTask&) {  // NOLINT
 
     {
         Poco::Mutex::ScopedLock lock(ws_client_m_);
-        ws_client_.Start(this, apitoken, on_websocket_message);
+        ws_client_.Start(this, apitoken,
+                         on_websocket_message, on_websocket_sync);
     }
 }
 
@@ -6926,6 +6961,13 @@ void on_websocket_message(
 
     Context *ctx = reinterpret_cast<Context *>(context);
     ctx->LoadUpdateFromJSONString(json);
+}
+
+void on_websocket_sync(void *context) {
+    poco_check_ptr(context);
+
+    Context *ctx = reinterpret_cast<Context *>(context);
+    ctx->SyncFromWebSocket();
 }
 
 void Context::TrackWindowSize(const Poco::UInt64 width,

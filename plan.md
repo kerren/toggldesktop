@@ -533,10 +533,31 @@ Cannot be done from the dev container: egress blocks `toggl.com` hosts, and
    seconds (capped at 300s) and falls back to incremental backoff when absent —
    confirm the header name and format, since a differently-named header (e.g.
    `X-RateLimit-Reset`) would be silently ignored.
-10. `desktop.track.toggl.com/stream` still accepts the websocket upgrade
-    (`src/websocket_client.cc:125`). Failure is silent and permanent: it retries
-    every 45s forever and degrades to ~15-30 minute polling with no user-visible
-    error.
+10. **The websocket handshake, and what the endpoint expects for auth.**
+    Confirmed dead from a maintainer's log (2026-08-02):
+    `desktop.track.toggl.com/stream` refuses the upgrade with
+    `Cannot upgrade to WebSocket connection: unknown`, i.e. a non-101 status —
+    Poco only raises that from `WebSocket.cpp:200`. The host was v8-only, so
+    this had been silently retrying every ≤45s and leaving the app on 15-30
+    minute polling with no user-visible error.
+
+    The client now targets `wss://track.toggl.com/websockets` and speaks the
+    current protocol (`{"action":..,"parameters":{..}}` up,
+    `{"event_type":..}` down), reacting to any change event with a debounced
+    `Context::Sync()` rather than trying to apply the frame — those frames
+    announce a change without carrying the record. Still unverified live, and
+    all of it is guarded by falling back to the periodic sync:
+    - whether Basic auth on the upgrade request is accepted, or whether the
+      endpoint only authenticates browser cookie sessions;
+    - whether the `{"action":"authenticate","parameters":{"api_token":..}}`
+      frame is the right stream-level handshake — the shape is inferred from
+      captured client frames, not from documentation;
+    - the event vocabulary. Unrecognised frames deliberately trigger a sync,
+      so a wrong guess costs an extra pull rather than a missed update.
+
+    **Test:** connect with a real token and log the frames
+    (`websocket_client:D:WebSocket message:`). A `kFrameServerError` line
+    naming the complaint is the signal that auth is wrong.
 11. **Confirm v9 uses 422 for validation rejections, and capture a real 422 body.**
     W2-D added explicit 422 handling on the assumption that v9 returns 422 (not
     400) for validation failures; the spec was not re-fetchable from the

@@ -14,6 +14,13 @@
 #define kHTTPClientTimeoutSeconds 30
 #define kSyncIntervalRangeSeconds 900
 #define kWebsocketRestartRangeSeconds 45
+// Client keepalive on an idle WebSocket, and how long silence has to last
+// before the connection counts as dead rather than quiet.
+#define kWebsocketPingIntervalSeconds 20
+#define kWebsocketStaleSeconds 60
+// How long a WebSocket change event waits before the pull it triggers runs,
+// so that a burst of events costs one sync instead of one sync each.
+#define kWebSocketSyncDebounceSeconds 10
 #define kCheckUpdateIntervalSeconds 86400
 #define kCheckInAppMessageIntervalSeconds 14400
 #define kRequestThrottleSeconds 2
