@@ -247,6 +247,24 @@ unrecognised 4xx body currently pins the entry as permanently unsynced with no
 recovery path and no log line naming the unmatched string. Log the unmatched body
 at warning and cap retries so one bad entry cannot wedge the push queue forever.
 
+**Status after W3-G (2026-08-02) — partially done:**
+
+- *Done:* `TimeEntry::ResolveError` now logs the unmatched body verbatim at
+  warning before returning false. This is the half that unblocks Phase 3 item 6
+  — the unmatched v9 wording was previously undiscoverable, so there was nothing
+  to diff the string table against.
+- *Done:* the string table was deliberately **left untouched**. Do not guess at
+  v9 wordings; wait for real captured bodies.
+- *NOT done — the retry cap.* It needs a decision this plan has not made: where
+  the counter lives and when it resets. A per-entry counter needs somewhere to
+  persist, and the obvious home is a new column on the time-entry table, i.e. a
+  SQLite schema migration — too large to attach to this slice, and risky on the
+  primary write path. An in-memory counter avoids the migration but resets every
+  restart, which bounds wedging per session rather than permanently. Neither is
+  obviously right without knowing how often unmatched bodies actually occur,
+  which is precisely what the new warning log is there to measure. **Recommend
+  shipping the log first, reading real logs, then sizing the cap.**
+
 ### 1.7 Bare `/tags` and `/tasks` do not exist in v9 (~1h)
 
 `Tag::ModelURL()` (`src/model/tag.cc:45`) and `Task::ModelURL()`

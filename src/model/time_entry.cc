@@ -71,6 +71,22 @@ bool TimeEntry::ResolveError(const error &err) {
         SetCreatedWith(HTTPClient::Config.UserAgent());
         return true;
     }
+    // Nothing above matched. The matchers all compare against hardcoded
+    // English substrings captured from API v8; v9 returns plain-string bodies
+    // that may well be reworded (plan.md 1.6). An unmatched body means the
+    // caller falls through to SetValidationError(), and because
+    // BaseModel::NeedsPush() requires ValidationError().empty()
+    // (base_model.cc:23) the entry is then pinned as unsynced with no
+    // recovery path.
+    //
+    // Log the body verbatim at warning so the unmatched string is
+    // discoverable at all -- without this there is no way to find out which
+    // v9 wording stopped matching, which is exactly what plan.md section 8
+    // item 6 needs captured. Deliberately not attempting to guess the v9
+    // strings here: that half of 1.6 waits on real captured error bodies.
+    logger().warning(
+        "Unrecognised error body while resolving time entry error -- the "
+        "entry will be pinned as unsynced. Body was: ", err);
     return false;
 }
 
