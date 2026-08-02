@@ -1833,16 +1833,17 @@ void Context::onTimelineUpdateServerSettings(Poco::Util::TimerTask&) {  // NOLIN
     }
 
     // v8 had a dedicated /timeline_settings endpoint. In v9 record_timeline
-    // is a property of the user, updated through PUT /api/v9/me (and read
-    // back from GET /api/v9/me).
+    // is a property of models.AllPreferences, not of the user payload, so it
+    // is updated through POST /api/v9/me/preferences/desktop (and read back
+    // from GET /api/v9/me/preferences/desktop).
     HTTPRequest req;
     req.host = urls::API();
-    req.relative_url = "/api/v9/me";
+    req.relative_url = "/api/v9/me/preferences/desktop";
     req.payload = json;
     req.basic_auth_username = apitoken;
     req.basic_auth_password = "api_token";
 
-    HTTPResponse resp = TogglClient::GetInstance().Put(req);
+    HTTPResponse resp = TogglClient::GetInstance().Post(req);
     if (resp.err != noError) {
         displayError(resp.err);
         logger.error(resp.body);
@@ -1941,7 +1942,7 @@ void Context::onSendFeedback(Poco::Util::TimerTask&) {  // NOLINT
 
     HTTPRequest req;
     req.host = urls::API();
-    req.relative_url ="/api/v9/feedback/web";
+    req.relative_url ="/api/v9/feedback";
     req.basic_auth_username = api_token_value;
     req.basic_auth_password = api_token_name;
     req.form = &form;
@@ -6057,15 +6058,16 @@ error Context::me(
     try {
         poco_check_ptr(user_data_json);
 
+        // GET /me accepts only with_related_data as a query param in v9.
+        // app_name and since do not exist in the v9 spec; since in
+        // particular never worked as incremental sync here (see plan.md
+        // §1.1) because /me returns no top-level since/server_time to
+        // advance from.
         std::stringstream ss;
         ss << "/api/"
            << kAPIV9
            << "/me"
-           << "?app_name=" << TogglClient::Config.AppName
-           << "&with_related_data=true";
-        if (since) {
-            ss << "&since=" << since;
-        }
+           << "?with_related_data=true";
 
         HTTPRequest req;
         req.host = urls::API();
