@@ -15,6 +15,7 @@
 #include "toggl_api.h"
 
 #include <Poco/Activity.h>
+#include <Poco/Mutex.h>
 #include <Poco/Timestamp.h>
 #include <Poco/Net/Context.h>
 #include <Poco/URI.h>
@@ -167,6 +168,22 @@ class TOGGL_INTERNAL_EXPORT HTTPClient {
 
     static error StatusCodeToError(const Poco::Int64 status_code);
 
+    // Strips secrets out of a JSON body so it can be written to the log.
+    //
+    // This is security-critical: feedback submissions attach the raw log file
+    // (see Context::SendFeedback), so anything that reaches the log reaches
+    // Toggl support. /me responses carry api_token, and me.payload accepts
+    // password / current_password.
+    //
+    // Bodies that are valid JSON get their sensitive members replaced by
+    // kRedactedValuePlaceholder, recursively. Bodies that are not parseable as
+    // JSON but mention a sensitive field name are suppressed entirely rather
+    // than logged on a best-effort basis.
+    //
+    // max_chars == 0 means "do not truncate".
+    static std::string RedactPayloadForLogging(
+        const std::string &payload, std::size_t max_chars = 0);
+
  protected:
     virtual HTTPResponse request(
         HTTPRequest req, bool_t loggingOn = true) const;
@@ -176,8 +193,42 @@ class TOGGL_INTERNAL_EXPORT HTTPClient {
  private:
     Poco::Net::Context::Ptr context; // share context with many Poco session
 
-    // We only make requests if this timestamp lies in the past.
+    // Per-host throttling state. All three maps are guarded by throttle_m_ --
+    // HTTPClient is used from several threads at once (the syncer activity,
+    // the timeline uploader, the ServerStatus checker and UI-initiated calls),
+    // so they must not be touched without the lock held.
+    static Poco::Mutex throttle_m_;
+
+    // We only make requests to a host if this timestamp lies in the past.
+    // Only ever set by a 429 response; cleared as soon as the host answers
+    // anything else.
     static std::map<std::string, Poco::Timestamp> banned_until_;
+
+    // Earliest moment the next request to a host may be sent. Implements the
+    // ~1 req/s per-host token bucket (plan.md 1.8).
+    static std::map<std::string, Poco::Timestamp> next_request_at_;
+
+    // Consecutive 429s seen from a host, used to size the incremental backoff.
+    static std::map<std::string, unsigned int> rate_limit_hits_;
+
+    // True while the host is in rate-limit backoff. Also drops entries whose
+    // backoff has expired.
+    bool isRateLimited(const std::string &host) const;
+
+    // Blocks the calling thread until this host's next request slot is due.
+    // Reserves the slot before returning, so concurrent callers queue up
+    // instead of all waking at the same instant. Never sleeps while holding
+    // the lock and never busy-waits.
+    void paceRequest(const std::string &host) const;
+
+    // Records a 429 from a host and extends its backoff.
+    // retry_after_seconds <= 0 means the server sent no usable Retry-After.
+    void noteRateLimited(
+        const std::string &host, Poco::Int64 retry_after_seconds) const;
+
+    // Records that a host answered something other than 429, clearing its
+    // backoff.
+    void noteNotRateLimited(const std::string &host) const;
 
     error accountLockingError(int remainingLogins) const;
 
@@ -210,6 +261,29 @@ class TOGGL_INTERNAL_EXPORT TogglClient : public HTTPClient {
         monitor_ = monitor;
     }
 
+    // TogglClient exposes two families of request methods.
+    //
+    // Post/Get/Delete/Put (inherited from HTTPClient, routed through
+    // TogglClient::request) are *gated*: they refuse to run while
+    // ServerStatus believes the backend is down, and they feed every response
+    // status back into ServerStatus. A single 5xx from any of them starts the
+    // background status checker, after which every gated request in the app
+    // short-circuits with kBackendIsDownError until GET /api/v9/status
+    // succeeds.
+    //
+    // silentPost/silentGet/silentDelete/silentPut bypass that gate entirely by
+    // calling HTTPClient::request directly. They still return the real error in
+    // HTTPResponse::err, they just do not let one endpoint's outage stop the
+    // rest of the app. This is the intended route for *best-effort* endpoints
+    // -- feedback, timeline uploads, update checks, countries, analytics --
+    // where a 5xx must not stall time-entry sync (plan.md 1.2).
+    //
+    // Rate-limit backoff and the ~1 req/s pacer live in HTTPClient and apply to
+    // both families.
+    //
+    // Note the asymmetry: silentGet also turns request logging off (it is used
+    // by the ServerStatus poller and by analytics, which would otherwise spam
+    // the log), while silentPost/silentDelete/silentPut keep logging on.
     HTTPResponse silentPost(
         HTTPRequest req) const;
 

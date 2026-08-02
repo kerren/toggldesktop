@@ -9,6 +9,21 @@
 
 namespace toggl {
 
+// A networking error means "we could not talk to the server". Callers treat it
+// as being offline: Context::pushChanges clears trigger_sync_ on it, GUI shows
+// the no-network state, and Context::login falls back to an offline login.
+//
+// Two errors are deliberately NOT listed here even though they come out of the
+// HTTP layer:
+//   - kRateLimit (HTTP 429, and the local backoff that follows it). The
+//     request reached the server and got an authoritative answer; the
+//     connection is healthy. Calling it a networking error made the app report
+//     successful throttling as a connectivity failure and stop triggering
+//     sync. Backoff is handled inside HTTPClient instead.
+//   - kUnprocessableEntityError (HTTP 422). A validation rejection. Resending
+//     the same payload can never succeed, so retrying it as if it were a
+//     transient network fault is exactly the wrong response. It is a user
+//     error instead -- see IsUserError below.
 bool IsNetworkingError(const error &err) {
     if (noError == err) {
         return false;
@@ -119,6 +134,12 @@ bool IsUserError(const error &err) {
         return true;
     }
     if (err.find(kBadRequestError) != std::string::npos) {
+        return true;
+    }
+    // HTTP 422 -- the server rejected the contents of the request. Surfaced as
+    // a user error so the UI shows it as actionable rather than as an
+    // application fault, and so it is never mistaken for being offline.
+    if (err.find(kUnprocessableEntityError) != std::string::npos) {
         return true;
     }
     if (err.find(kUnauthorizedError) != std::string::npos) {

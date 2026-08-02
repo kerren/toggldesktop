@@ -4,6 +4,7 @@
 
 #include <json/json.h>
 
+#include <cstddef>
 #include <string>
 #include <sstream>
 #include <memory>
@@ -36,9 +37,68 @@
 #include <Poco/NumberParser.h>
 #include <Poco/StreamCopier.h>
 #include <Poco/TextEncoding.h>
+#include <Poco/Thread.h>
 #include <Poco/UTF8Encoding.h>
 
 namespace toggl {
+
+namespace {
+
+// Member names whose values must never reach the log. Feedback submissions
+// attach the raw log file, so anything logged is shipped to Toggl support.
+//   - api_token: present in every /me response and in the sync payloads.
+//   - password / current_password: accepted by me.payload and by /signup.
+//   - the OAuth-ish tokens the app forwards as a password on login.
+//   - login_token: the one-shot token behind "open reports in browser".
+const char *const kSensitivePayloadKeys[] = {
+    "api_token",
+    "token",
+    "access_token",
+    "session_token",
+    "login_token",
+    "google_access_token",
+    "apple_token",
+    "password",
+    "current_password",
+    "new_password"
+};
+
+bool isSensitivePayloadKey(const std::string &key) {
+    for (const char *const candidate : kSensitivePayloadKeys) {
+        if (key == candidate) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool mentionsSensitivePayloadKey(const std::string &text) {
+    for (const char *const candidate : kSensitivePayloadKeys) {
+        if (text.find(candidate) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void redactSensitiveMembers(Json::Value *node) {
+    if (node->isObject()) {
+        const Json::Value::Members members = node->getMemberNames();
+        for (const std::string &name : members) {
+            if (isSensitivePayloadKey(name)) {
+                (*node)[name] = kRedactedValuePlaceholder;
+            } else {
+                redactSensitiveMembers(&(*node)[name]);
+            }
+        }
+    } else if (node->isArray()) {
+        for (Json::ArrayIndex i = 0; i < node->size(); i++) {
+            redactSensitiveMembers(&(*node)[i]);
+        }
+    }
+}
+
+}  // namespace
 
 void HTTPClient::SetCACertPath(std::string path) {
     if (path.compare(Config.CACertPath()) == 0) {
@@ -174,10 +234,153 @@ void ServerStatus::UpdateStatus(const Poco::Int64 code) {
 }
 
 HTTPClientConfig HTTPClient::Config;
+Poco::Mutex HTTPClient::throttle_m_;
 std::map<std::string, Poco::Timestamp> HTTPClient::banned_until_;
+std::map<std::string, Poco::Timestamp> HTTPClient::next_request_at_;
+std::map<std::string, unsigned int> HTTPClient::rate_limit_hits_;
 
 Logger HTTPClient::logger() const {
     return { "HTTPClient" };
+}
+
+std::string HTTPClient::RedactPayloadForLogging(
+    const std::string &payload, std::size_t max_chars) {
+
+    if (payload.empty()) {
+        return payload;
+    }
+
+    std::string result;
+
+    Json::Value root;
+    Json::Reader reader;
+    if (reader.parse(payload, root, false)
+            && (root.isObject() || root.isArray())) {
+        redactSensitiveMembers(&root);
+        result = Json::FastWriter().write(root);
+        // FastWriter appends a newline; a log line does not want it.
+        while (!result.empty()
+                && (result[result.size() - 1] == '\n'
+                    || result[result.size() - 1] == '\r')) {
+            result.erase(result.size() - 1);
+        }
+    } else if (mentionsSensitivePayloadKey(payload)) {
+        // Not JSON we can walk, but it names something sensitive. Refuse to
+        // log it at all rather than leak it through a best-effort scrub.
+        return "<redacted: unparseable body mentioning sensitive fields>";
+    } else {
+        result = payload;
+    }
+
+    if (max_chars > 0 && result.size() > max_chars) {
+        result.resize(max_chars);
+        result += "...<truncated>";
+    }
+
+    return result;
+}
+
+bool HTTPClient::isRateLimited(const std::string &host) const {
+    Poco::Mutex::ScopedLock lock(throttle_m_);
+
+    std::map<std::string, Poco::Timestamp>::iterator it =
+        banned_until_.find(host);
+    if (it == banned_until_.end()) {
+        return false;
+    }
+    if (it->second >= Poco::Timestamp()) {
+        return true;
+    }
+    // Backoff has expired.
+    banned_until_.erase(it);
+    return false;
+}
+
+void HTTPClient::paceRequest(const std::string &host) const {
+    Poco::Timestamp::TimeDiff wait_micros = 0;
+
+    {
+        Poco::Mutex::ScopedLock lock(throttle_m_);
+
+        const Poco::Timestamp now;
+        Poco::Timestamp slot = now;
+
+        std::map<std::string, Poco::Timestamp>::const_iterator it =
+            next_request_at_.find(host);
+        if (it != next_request_at_.end() && it->second > now) {
+            slot = it->second;
+        }
+
+        // Bound how far ahead the queue may stretch, so a pile-up of threads
+        // cannot block any single one of them for minutes.
+        const Poco::Timestamp horizon = now
+            + (Poco::Timestamp::TimeDiff(kMaxRequestPacingSeconds)
+               * kOneSecondInMicros);
+        if (slot > horizon) {
+            slot = horizon;
+        }
+
+        // Reserve this slot before releasing the lock, so a concurrent caller
+        // queues behind us rather than racing us for the same instant.
+        next_request_at_[host] = slot
+            + (Poco::Timestamp::TimeDiff(kMinRequestIntervalMillis) * 1000);
+
+        wait_micros = slot - now;
+    }
+
+    // Deliberately outside the lock: never sleep while holding it.
+    if (wait_micros > 0) {
+        Poco::Thread::sleep(static_cast<long>(wait_micros / 1000) + 1);
+    }
+}
+
+void HTTPClient::noteRateLimited(
+    const std::string &host, Poco::Int64 retry_after_seconds) const {
+
+    Poco::Int64 seconds = 0;
+    unsigned int hits = 0;
+    Poco::Timestamp until;
+
+    {
+        Poco::Mutex::ScopedLock lock(throttle_m_);
+
+        hits = ++rate_limit_hits_[host];
+
+        if (retry_after_seconds > 0) {
+            seconds = retry_after_seconds;
+            if (seconds > kRateLimitRetryAfterMaxSeconds) {
+                seconds = kRateLimitRetryAfterMaxSeconds;
+            }
+        } else {
+            // Incremental backoff instead of the old flat 60 second ban:
+            // 5s, 10s, 20s, 40s, then capped at kRateLimitBackoffMaxSeconds.
+            seconds = kRateLimitBackoffBaseSeconds;
+            for (unsigned int i = 1;
+                    i < hits && seconds < kRateLimitBackoffMaxSeconds; i++) {
+                seconds *= 2;
+            }
+            if (seconds > kRateLimitBackoffMaxSeconds) {
+                seconds = kRateLimitBackoffMaxSeconds;
+            }
+        }
+
+        until = Poco::Timestamp()
+            + (seconds * Poco::Timestamp::TimeDiff(kOneSecondInMicros));
+        banned_until_[host] = until;
+        // Do not let the pacer hand out a slot before the backoff is over.
+        next_request_at_[host] = until;
+    }
+
+    logger().warning(
+        "Rate limited by host ", host, " (consecutive 429s: ", hits,
+        "). Backing off for ", seconds, "s, until ",
+        Formatter::Format8601(until));
+}
+
+void HTTPClient::noteNotRateLimited(const std::string &host) const {
+    Poco::Mutex::ScopedLock lock(throttle_m_);
+    rate_limit_hits_.erase(host);
+    banned_until_.erase(host);
 }
 
 bool HTTPClient::isRedirect(const Poco::Int64 status_code) const {
@@ -212,8 +415,19 @@ error HTTPClient::StatusCodeToError(const Poco::Int64 status_code) {
         return kEndpointGoneError;
     case 418:
         return kUnsupportedAppError;
+    case 422:
+        // The server understood the request and rejected its contents.
+        // NOT a networking error: the same payload will never be accepted, so
+        // reporting "cannot connect" and retrying forever is wrong.
+        return kUnprocessableEntityError;
     case 429:
-        return kCannotConnectError;
+        // Rate limited. NOT a networking error either -- the request reached
+        // the server and got an authoritative answer. Mapping this to
+        // kCannotConnectError made IsNetworkingError() classify successful
+        // throttling as being offline, which cleared trigger_sync_ and showed
+        // the user a connectivity error. The backoff is handled by
+        // noteRateLimited() / banned_until_, not by the error code.
+        return kRateLimit;
     case 500:
         return kBackendIsDownError;
     case 501:
@@ -297,15 +511,14 @@ HTTPResponse HTTPClient::makeHttpRequest(
         return resp;
     }
 
-    std::map<std::string, Poco::Timestamp>::const_iterator cit =
-        banned_until_.find(req.host);
-    if (cit != banned_until_.end()) {
-        if (cit->second >= Poco::Timestamp()) {
-            logger().warning(
-                "Cannot connect, because we made too many requests");
-            resp.err = kCannotConnectError;
-            return resp;
-        }
+    if (isRateLimited(req.host)) {
+        logger().warning(
+            "Not sending request to ", req.host,
+            ", still backing off after too many requests");
+        // Deliberately kRateLimit and not kCannotConnectError: we are
+        // throttled, not offline. See StatusCodeToError(429).
+        resp.err = kRateLimit;
+        return resp;
     }
 
     if (req.host.empty()) {
@@ -324,6 +537,11 @@ HTTPResponse HTTPClient::makeHttpRequest(
         resp.err = error("Cannot make a HTTP request without certificates");
         return resp;
     }
+
+    // Client-side pacing (plan.md 1.8). Placed after every early return above
+    // so a request that is never going to be sent does not consume a slot, and
+    // so the test environment (urls::RequestsAllowed() == false) never waits.
+    paceRequest(req.host);
 
     try {
         Poco::URI uri(req.host);
@@ -423,6 +641,19 @@ HTTPResponse HTTPClient::makeHttpRequest(
         poco_req.write(request_string);
         if (loggingOn) {
             logger().debug(request_string.str());
+            // Log the outgoing body (plan.md 2.5). Redacted first -- feedback
+            // submissions attach the raw log file, so this reaches Toggl
+            // support. Multipart forms are not logged: they carry the log file
+            // and arbitrary attachments.
+            if (req.form) {
+                logger().debug(
+                    "Request body: <multipart form, not logged>");
+            } else if (!req.payload.empty()) {
+                logger().debug(
+                    "Request body: ",
+                    RedactPayloadForLogging(
+                        req.payload, kMaxLoggedRequestBodyChars));
+            }
             logger().debug("Request sent. Receiving response..");
         }
 
@@ -481,15 +712,27 @@ HTTPResponse HTTPClient::makeHttpRequest(
                 logger().debug(n, " characters transferred with download");
         }
 
+        // /me responses carry api_token, so the response body is redacted
+        // before it is traced (plan.md 2.5).
         if (loggingOn)
-            logger().trace(resp.body);
+            logger().trace(RedactPayloadForLogging(resp.body));
 
         if (429 == resp.status_code) {
-            Poco::Timestamp ts = Poco::Timestamp() + (60 * kOneSecondInMicros);
-            banned_until_[req.host] = ts;
-
-            logger().debug("Server indicated we're making too many requests to host ", req.host,
-                           ". So we cannot make new requests until ", Formatter::Format8601(ts));
+            // Incremental backoff rather than a flat 60 second ban.
+            // v9 is not documented as sending Retry-After (plan.md section 8
+            // item 9), but honour it if it ever shows up.
+            Poco::Int64 retry_after = 0;
+            if (response.has("Retry-After")) {
+                int parsed = 0;
+                if (Poco::NumberParser::tryParse(
+                        response.get("Retry-After"), parsed) && parsed > 0) {
+                    retry_after = parsed;
+                }
+            }
+            noteRateLimited(req.host, retry_after);
+        } else {
+            // The host answered, so it is not throttling us right now.
+            noteNotRateLimited(req.host);
         }
 
         resp.err = StatusCodeToError(resp.status_code);
@@ -563,10 +806,21 @@ HTTPResponse TogglClient::request(
     // We only update Toggl status from this
     // client, not websocket or regular http client,
     // as they are not critical.
-    TogglStatus.UpdateStatus(resp.status_code);
+    //
+    // status_code 0 means no HTTP response was received at all (local
+    // short-circuit, rate-limit backoff, socket error). That is not evidence
+    // about the backend's health, and feeding it in here would stop a status
+    // check that is legitimately running.
+    if (resp.status_code != 0) {
+        TogglStatus.UpdateStatus(resp.status_code);
+    }
 
     return resp;
 }
+
+// The silent* family bypasses the ServerStatus gate above -- see the comment
+// on their declarations in https_client.h. They are the route for best-effort
+// endpoints whose failures must not stall time-entry sync (plan.md 1.2).
 
 HTTPResponse TogglClient::silentPost(
     HTTPRequest req) const {

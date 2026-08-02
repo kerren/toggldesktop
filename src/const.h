@@ -35,6 +35,39 @@
 #define kMaximumDescriptionLength 3000
 #define kTimeComparisonEpsilonMicroSeconds 100000 // 100 ms
 
+// Client-side request pacing (plan.md 1.8).
+//
+// The v9 rate limit is documented as roughly one request per second per
+// token+IP (leaky bucket). The push path issues one request per dirty model,
+// so a sync cycle after offline use would otherwise fire a burst straight into
+// that limit. HTTPClient::request paces outbound requests per host to at most
+// one every kMinRequestIntervalMillis.
+//
+// NOTE: the exact server-side threshold is unverified from this container --
+// see plan.md section 8 item 9. 1000 ms is the documented "~1 req/s" figure
+// with no safety margin; if live testing shows 429s still arriving, raise it.
+#define kMinRequestIntervalMillis 1000
+// Upper bound on how far into the future a request may be queued by the pacer.
+// Bounds the worst-case blocking time of a single request when several threads
+// are issuing requests at once. Requests are issued serially per thread, so in
+// practice a single wait is <= kMinRequestIntervalMillis.
+#define kMaxRequestPacingSeconds 10
+
+// Incremental backoff applied to a host that answered 429 (plan.md 1.4/1.8).
+// Replaces the old flat 60 second ban: 5s, 10s, 20s, 40s, 60s, 60s, ...
+// The counter resets as soon as the host answers anything other than a 429.
+#define kRateLimitBackoffBaseSeconds 5
+#define kRateLimitBackoffMaxSeconds 60
+// Cap applied to a server-supplied Retry-After value, so a bogus header
+// cannot take the client offline indefinitely.
+#define kRateLimitRetryAfterMaxSeconds 300
+
+// Outgoing request bodies are logged at debug level (plan.md 2.5). Feedback
+// submissions attach the raw log file, so bodies are redacted first and
+// truncated to keep the log a reasonable size.
+#define kMaxLoggedRequestBodyChars 8192
+#define kRedactedValuePlaceholder "<redacted>"
+
 #define kLostPasswordURL "https://toggl.com/forgot-password?desktop=true"
 #define kGeneralSupportURL "https://support.toggl.com/toggl-on-my-desktop/"
 #define kLinuxSupportURL "https://support.toggl.com/toggl-desktop-for-linux/"
@@ -65,6 +98,12 @@
 #define kBackendIsDownError "Backend is down"
 #define kBackendIsSendingInvalidData "Backend is sending invalid data"
 #define kBadRequestError "Data that you are sending is not valid/acceptable"
+// HTTP 422. The server understood the request and rejected the *contents*.
+// Deliberately distinct from kBadRequestError (400) so the two can be told
+// apart in logs, and deliberately NOT a networking error: resending the same
+// payload can never succeed, so it must not be reported as "you are offline"
+// nor retried forever. See error.cc IsNetworkingError / IsUserError.
+#define kUnprocessableEntityError "Data that you are sending was rejected as invalid by the server"  // NOLINT
 #define kRequestIsNotPossible "Request is not possible"
 #define kPaymentRequiredError "Requested action allowed only for Non-Free workspaces. Please upgrade!"  // NOLINT
 #define kCannotAccessWorkspaceError "cannot access workspace"
@@ -79,7 +118,13 @@
 #define kUnacceptableCertificate "Unacceptable certificate from www.toggl.com"
 #define kCannotUpgradeToWebSocketConnection "Cannot upgrade to WebSocket connection"  // NOLINT
 #define kSSLException "SSL Exception"
-#define kRateLimit "Too many requests, sync delayed by 1 minute"
+// HTTP 429. This is the error StatusCodeToError returns for a rate-limited
+// request, and the one HTTPClient returns while a host is in rate-limit
+// backoff. It is deliberately NOT a networking error: the request reached the
+// server and got an authoritative answer, so reporting it as "offline" (and
+// clearing trigger_sync_ with it) is wrong. The delay is no longer a flat
+// minute -- see kRateLimitBackoffBaseSeconds.
+#define kRateLimit "Too many requests, sync delayed"
 #define kCannotWriteFile "Cannot write file"
 #define kIsSuspended "is suspended"
 #define kRequestToServerFailedWithStatusCode403 "Request to server failed with status code: 403"  // NOLINT
