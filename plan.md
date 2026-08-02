@@ -485,6 +485,19 @@ Cannot be done from the dev container: egress blocks `toggl.com` hosts, and
    (see 1.6).
 7. Start a timer and confirm v9 accepts a **negative-epoch** duration, not just
    `-1` (see 1.9).
+
+   *Confirmed by code inspection in W1-C (2026-08-01), encoding deliberately
+   left unchanged:* running entries are sent as `duration = -start`, i.e. the
+   negated Unix epoch seconds of the start time — exactly the v8 convention.
+   There are **two** sites, not one: `TimeEntry::SetStartUserInput`
+   (`src/model/time_entry.cc:307`) and `TimeEntry::SetDurationUserInput`
+   (`:334`), the latter reaching the same state via
+   `SetStartTime` + `SetDurationInSeconds(-start, true)`. Both now carry a
+   comment recording that this is pending live verification. `-start` is
+   genuinely negative so it should satisfy v9's "negative duration" rule, but
+   this is an untested assumption on the app's most important write path.
+   **Test:** start a timer against v9 and confirm the negative-epoch value is
+   accepted, not just `-1`.
 8. Does `GET /me?with_related_data=true` return the full time-entry history or a
    bounded window? v8 returned everything. If v9 bounds it, first sync after login
    shows fewer entries than users expect, and 1.1 stops being optional.
