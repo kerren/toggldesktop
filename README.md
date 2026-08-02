@@ -1,11 +1,12 @@
-### ⚠️ Project Status: Superseded by new rewritten apps.
+### ⚠️ Project Status: Linux revival
 
-We have rewritten our MacOS and Windows apps and for that reason **we will no longer implement nor accept pull requests** implementing new features in this repository.
+Upstream stopped developing this repository — the desktop clients were rewritten as
+separate native apps, and this codebase was left behind. **The goal of this fork is to
+get Toggl Desktop building and running on Linux again**, on a current distro, against
+the current Toggl API.
 
-If you'd like to try these rewritten native apps, visit:
-
-* [ ] 🍏 [MacOS Toggl Track](https://toggl.com/track/time-tracking-mac)
-* [ ] 🖥 [Windows Toggl Track](https://toggl.com/track/time-tracking-windows/)
+Everything here is aimed at the Linux (Qt) client and the shared C++ core it sits on.
+The macOS and Windows front-ends are out of scope for this fork.
 
 <h1></h1>
 
@@ -13,7 +14,7 @@ If you'd like to try these rewritten native apps, visit:
   <a href="https://toggl.com"><img src="https://raw.githubusercontent.com/toggl-open-source/toggldesktop/gh-pages/assets/toggl-track-wide.png" alt="Toggl Track"></a>
 </h1>
 
-<h4 align="center">Native desktop applications for the leading time tracking tool <a href="https://toggl.com" target="_blank">Toggl</a>.</h4>
+<h4 align="center">Native Linux desktop client for the time tracking tool <a href="https://toggl.com" target="_blank">Toggl</a>.</h4>
 
 <p align="center">
     <a href="https://github.com/toggl-open-source/toggldesktop/commits/master">
@@ -31,8 +32,8 @@ If you'd like to try these rewritten native apps, visit:
 
 <p align="center">
   <a href="#about">About</a> •
-  <a href="#download">Download</a> •
-  <a href="#build">Build</a> •
+  <a href="#goal">Goal</a> •
+  <a href="#build-on-linux">Build on Linux</a> •
   <a href="#change-log">Change log</a> •
   <a href="#contribute">Contribute</a>
 </p>
@@ -41,86 +42,62 @@ If you'd like to try these rewritten native apps, visit:
 
   **Toggl Desktop** is a Toggl time tracking client with many helper functions that make tracking time more effortless and smooth. Features such as Idle detection, reminders to track and Pomodoro Timer make this app a great companion when productivity and efficiency is the goal.
 
-<img src="https://user-images.githubusercontent.com/842229/63856838-3a869580-c9ab-11e9-9e36-7db23059ce29.png"
-         alt="Toggl Desktop apps">
+The Linux client is a Qt 5 application (`src/ui/linux`) on top of a shared C++ core
+library (`TogglDesktopLibrary`) that handles syncing, storage and the Toggl API.
 
-# Download
+# Goal
 
-Toggl built and signed apps for all platforms
+Make this build, run and sync on Linux again:
 
-## Mac
+1. **Build from source on a current distro** — the CMake build and the Qt 5 GUI target
+   compile without patching.
+2. **Talk to the live API** — the old Toggl API v8 was shut down in 2024, so everything
+   the app does has to go through `/api/v9`. See [`plan.md`](plan.md) for the migration
+   status and remaining work.
+3. **Keep the core green** — `TogglDesktopLibrary` and `TogglAppTest` build and all unit
+   tests pass. This is what CI gates on (`.github/workflows/linux-core.yml`).
 
-<br>
-<a href="https://toggl.github.io/toggldesktop/download/macos-stable/">64bit dmg</a>&nbsp;&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;&nbsp;<a href='https://itunes.apple.com/ee/app/toggl-desktop/id957734279?mt=12'>
-  Mac App Store</a>
-<br/>
-<br/>
-<i>Officially macOS 10.11 and newer stable macOS versions are supported.</i>
+# Build on Linux
 
-## Windows
-
-<br/>
-<a href="https://toggl.github.io/toggldesktop/download/windows64-stable/">64bit installer</a>&nbsp;&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;&nbsp;<a href="https://toggl.github.io/toggldesktop/download/windows-stable/">32bit installer</a>&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;&nbsp;<a href="https://chocolatey.org/packages/toggl">Chocolatey</a>&nbsp;&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;&nbsp;<a href='//www.microsoft.com/store/apps/9nk3rf9nbjnp?cid=storebadge&ocid=badge'>Microsoft Store</a>
-<br/>
-<br/>
-<i>App has been tested on Windows 7, 8, 8.1 and 10. Toggl Desktop Windows app has not been tested on Surface type touchscreen environments.</i>
-
-## Linux
-
-<br>
-<a href="https://toggl.github.io/toggldesktop/download/linux_tar.gz-stable/">Tarball</a>&nbsp;&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;&nbsp;<a href='https://flathub.org/apps/details/com.toggl.TogglDesktop'>Flathub</a>&nbsp;&nbsp;&nbsp;&nbsp;
-<br/>
-<br/>
-<i>Only 64bit is supported</i>
-
-# Build
-
-Please check OS specific requirements below.
-
-_By default the app builds for testing server. To use the compiled app with live server see this guide [https://github.com/toggl-open-source/toggldesktop/wiki/Building-Toggl-Desktop-from-source-for-usage-with-live-servers](https://github.com/toggl-open-source/toggldesktop/wiki/Building-Toggl-Desktop-from-source-for-usage-with-live-servers)_
-
-## macOS
-### Requirements
-- macOS 11+, Xcode 12.2+ and Swift 5+
-- Install Bundler
-```bash
-$ sudo gem install bundler
-```
-
-### Build
-```bash
-# Prepare cocoapod
-$ make init_cocoapods
-```
-Run `bundle exec pod repo update` in case there is an error about out-of-date source repos (some pod version is missing).
-
-- Open workspace at `src/ui/osx/TogglDesktop.xcworkspace`
-- Select TogglDesktop scheme and build.
-
-## Linux
+_By default the app builds against the testing server. To use the compiled app with the
+live server see [this guide](https://github.com/toggl-open-source/toggldesktop/wiki/Building-Toggl-Desktop-from-source-for-usage-with-live-servers)._
 
 ### Dependencies
 
-You'll need these Qt (at version 5.12 or higher) modules: QtWidgets (with private headers), QtNetwork, QtNetworkAuth, QtDBus, QtX11Extras
+You'll need Qt 5 (5.12 or higher) — in particular **qtbase**, including its private
+headers — plus QtNetwork, QtNetworkAuth, QtDBus and QtX11Extras.
 
-If Qt is not installed from your distribution's package manager, you will need to set the `CMAKE_PREFIX_PATH` environment variable to point to the `lib/cmake` folder in the Qt version you wish to use.
+On Debian/Ubuntu, the two packages that are easy to miss — and that CMake fails on
+first — are **qtbase** and **QtNetworkAuth**:
 
-These dependencies are mandatory:
- * libXScrnSaver (`libxss-dev` in deb-based distros and `libXScrnSaver-devel` in rpm-based)
-
- You can install them all in debian with a command:
 ```bash
- $ sudo apt install libxss-dev build-essential libgl-dev libreadline-dev
+$ sudo apt install qtbase5-dev
+$ sudo apt install libqt5networkauth5-dev
+```
 
- ```
- 
-These dependencies are optional and will be bundled if the `USE_BUNDLED_LIBRARIES` CMake argument is set or your system does NOT have their development packages installed:
- * POCO
+Then the rest of the Qt modules and the mandatory system libraries:
+
+```bash
+$ sudo apt install qtbase5-private-dev libqt5x11extras5-dev \
+    libxss-dev libxmu-dev libssl-dev build-essential cmake pkg-config \
+    libgl-dev libreadline-dev
+```
+
+`libXScrnSaver` (`libxss-dev` on deb-based distros, `libXScrnSaver-devel` on rpm-based)
+is required for idle detection.
+
+If Qt is not installed from your distribution's package manager, set the
+`CMAKE_PREFIX_PATH` environment variable to point at the `lib/cmake` folder of the Qt
+version you want to use.
+
+These dependencies are optional and will be bundled if the `USE_BUNDLED_LIBRARIES` CMake
+argument is set, or if your system does NOT have their development packages installed:
+ * POCO (`libpoco-dev`)
  * Lua
- * jsoncpp
+ * jsoncpp (`libjsoncpp-dev`)
  * Qxt
 
-These libraries will be bundled regardless of your system:
+These libraries are bundled regardless of your system:
  * bugsnag-qt
  * qt-oauth-lib
 
@@ -134,14 +111,15 @@ make -j8                                  # Build the app. The number defines th
 ./src/ui/linux/TogglDesktop/TogglDesktop  # Run the built app
 ```
 
-## Windows
+### Build just the core and its tests
 
-Install Visual Studio 2019 with `.NET desktop development`, `Desktop development with C++` and `Universal Windows Platform development` components checked during installation. You can download free Visual Studio Community [here](https://visualstudio.microsoft.com/vs/community/).
+Useful for headless work on the library — this skips the GUI:
 
-Then open the solution file `src\ui\windows\TogglDesktop\TogglDesktop.sln` and run it in `Debug` mode.
-
-The solution is using OpenSSL binaries. To rebuild OpenSSL from sources refer to [this page](docs/win/build-openSSL.md).
-
+```bash
+cmake -S . -B build -DTOGGL_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target TogglDesktopLibrary TogglAppTest -j"$(nproc)"
+cd build && ./src/test/TogglAppTest        # must run from build/, fixtures use ../testdata
+```
 
 # Change log
 
@@ -166,4 +144,3 @@ Check if unit tests continue to pass:
 ```bash
 $ make test
 ```
-
