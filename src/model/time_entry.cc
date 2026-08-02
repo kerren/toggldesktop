@@ -71,6 +71,22 @@ bool TimeEntry::ResolveError(const error &err) {
         SetCreatedWith(HTTPClient::Config.UserAgent());
         return true;
     }
+    // Nothing above matched. The matchers all compare against hardcoded
+    // English substrings captured from API v8; v9 returns plain-string bodies
+    // that may well be reworded (plan.md 1.6). An unmatched body means the
+    // caller falls through to SetValidationError(), and because
+    // BaseModel::NeedsPush() requires ValidationError().empty()
+    // (base_model.cc:23) the entry is then pinned as unsynced with no
+    // recovery path.
+    //
+    // Log the body verbatim at warning so the unmatched string is
+    // discoverable at all -- without this there is no way to find out which
+    // v9 wording stopped matching, which is exactly what plan.md section 8
+    // item 6 needs captured. Deliberately not attempting to guess the v9
+    // strings here: that half of 1.6 waits on real captured error bodies.
+    logger().warning(
+        "Unrecognised error body while resolving time entry error -- the "
+        "entry will be pinned as unsynced. Body was: ", err);
     return false;
 }
 
@@ -304,6 +320,15 @@ void TimeEntry::SetStartUserInput(const std::string &value,
                                   bool keepEndTimeFixed) {
     Poco::Int64 start = Formatter::Parse8601(value);
     if (IsTracking()) {
+        // NOTE (plan.md 1.9): a running entry is encoded here as the
+        // NEGATIVE EPOCH START TIME (-start), which is the v8 convention.
+        // v9's spec documents running entries as "negative duration, -1
+        // recommended" -- it does not say -1 is mandatory, and a negative
+        // epoch value *is* negative, so this is expected to still work.
+        // This is unverified against the live v9 API (no token available
+        // in this environment) and sits on the app's most important write
+        // path. Do NOT change this encoding without live verification --
+        // see plan.md Phase 3 item 7 (§8) before touching it.
         SetDurationInSeconds(-start, true);
     } else {
         auto stop = StopTime();
@@ -331,6 +356,9 @@ void TimeEntry::SetDurationUserInput(const std::string &value) {
         time_t now = time(nullptr);
         time_t start = now - seconds;
         SetStartTime(start, true);
+        // NOTE (plan.md 1.9): same negative-epoch v8 running-entry encoding
+        // as SetStartUserInput() above -- see the comment there. Pending
+        // live verification (plan.md §8 item 7); do not change without it.
         SetDurationInSeconds(-start, true);
     } else {
         SetDurationInSeconds(seconds, true);

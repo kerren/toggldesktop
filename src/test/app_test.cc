@@ -2,12 +2,16 @@
 
 #include "gtest/gtest.h"
 
+#include <algorithm>
+#include <ctime>
 #include <iostream>  // NOLINT
 
 #include "model/autotracker.h"
 #include "model/client.h"
 #include "const.h"
 #include "database/database.h"
+#include "error.h"
+#include "https_client.h"
 #include "util/formatter.h"
 #include "model/project.h"
 #include "proxy.h"
@@ -27,6 +31,9 @@
 #include "Poco/FileStream.h"
 #include "Poco/Logger.h"
 #include "Poco/LocalDateTime.h"
+#include <Poco/AutoPtr.h>
+#include <Poco/Channel.h>
+#include <Poco/Message.h>
 #include <Poco/SimpleFileChannel.h>
 #include <Poco/FormattingChannel.h>
 #include <Poco/PatternFormatter.h>
@@ -55,6 +62,49 @@ class Database {
 
  private:
     toggl::Database *db_;
+};
+
+// A Poco::Channel that just remembers every message logged to it, so tests
+// can assert that a particular warning was actually logged (used to verify
+// User::CompressTimeline logs when it evicts an un-uploaded timeline event
+// past the retention ceiling; see plan.md 1.3). Must be heap-allocated
+// (Poco::Channel is reference-counted and deletes itself), so always use it
+// through a Poco::AutoPtr, e.g. `Poco::AutoPtr<CapturingChannel> capture(new
+// CapturingChannel());`.
+class CapturingChannel : public Poco::Channel {
+ public:
+    void log(const Poco::Message &msg) override {
+        messages_.push_back(msg.getText());
+    }
+    bool anyMessageContains(const std::string &needle) const {
+        for (const auto &message : messages_) {
+            if (message.find(needle) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+ private:
+    std::vector<std::string> messages_;
+};
+
+// Installs a replacement channel on the named Poco::Logger for its
+// lifetime, restoring the original channel on destruction.
+class ScopedLogChannel {
+ public:
+    ScopedLogChannel(const std::string &logger_name, Poco::Channel::Ptr replacement)
+        : logger_(Poco::Logger::get(logger_name))
+        , original_channel_(logger_.getChannel()) {
+        logger_.setChannel(replacement);
+    }
+    ~ScopedLogChannel() {
+        logger_.setChannel(original_channel_);
+    }
+
+ private:
+    Poco::Logger &logger_;
+    Poco::Channel::Ptr original_channel_;
 };
 
 }  // namespace testing
@@ -141,14 +191,36 @@ TEST(User, CreateCompressedTimelineBatchForUpload) {
 
     std::vector<ModelChange> changes;
 
+    // Everything in this test is positioned relative to the 15 minute chunk
+    // grid that User::CompressTimeline works on, NOT to "n seconds ago".
+    // Wall-clock-relative offsets make this test flaky, because whether two
+    // offsets share a chunk depends on where in the current chunk the test
+    // happens to run. See the two comments below for the specific traps.
+    const time_t now = time(0);
+    const time_t chunk_start =
+        (now / kTimelineChunkSeconds) * kTimelineChunkSeconds;
+
     Poco::UInt64 good_duration_seconds(30);
 
     // Event that happened at least 15 minutes ago,
     // can be uploaded to Toggl backend.
+    //
+    // `good`, `good2` and `uploaded` below must all land in the SAME chunk:
+    // CompressTimeline keys chunks on filename/title/idle plus the chunk start
+    // time, so a chunk boundary falling between them produces two chunks and
+    // the expected count of 2 further down becomes 3.
+    //
+    // Do NOT write `time(0) - 86400 - 60*16` here. 86400 is a whole number of
+    // chunks, so that offset sits 60 seconds before a chunk boundary relative
+    // to `now`, and `good2` starts 31 seconds after `good` ends -- which puts
+    // the two in different chunks whenever now % 900 is in [29, 60). Anchoring
+    // `good` to a chunk boundary a day back makes their ~1 minute span fit
+    // inside one chunk at every wall-clock time.
     TimelineEvent *good = new TimelineEvent();
     good->SetUID(user_id);
-    // started yesterday, "16 minutes ago"
-    good->SetStartTime(time(0) - 86400 - 60*16);
+    // started yesterday, at the start of a 15 minute chunk
+    good->SetStartTime(
+        ((now - 86400) / kTimelineChunkSeconds) * kTimelineChunkSeconds);
     good->SetEndTime(good->Start() + good_duration_seconds);
     good->SetFilename("Notepad.exe");
     good->SetTitle("untitled");
@@ -177,32 +249,57 @@ TEST(User, CreateCompressedTimelineBatchForUpload) {
     uploaded->SetUploaded(true);
     user.related.TimelineEvents.push_back(uploaded);
 
-    // This event happened less than 15 minutes ago,
-    // so it must not be uploaded
+    // This event belongs to the *current*, still incomplete 15 minute chunk,
+    // so it must not be uploaded.
+    //
+    // Do NOT write `time(0) - 60` here. User::CompressTimeline only compresses
+    // events whose Start() is strictly below the current chunk boundary
+    // `(now / kTimelineChunkSeconds) * kTimelineChunkSeconds`
+    // (src/model/user.cc). During the first 60 seconds of any 15 minute chunk
+    // `now - 60` lands in the *previous* chunk and this event gets compressed
+    // after all -- a real ~6.7% (60s in every 900s) flake that has nothing to
+    // do with the code under test. Clamping the start to the chunk boundary
+    // keeps the event inside the current chunk at every wall-clock time.
+    //
+    // std::max is correct on the boundary itself: when now % 900 == 0 the
+    // start equals chunk_start, and the compression check is a strict `<`.
     TimelineEvent *too_fresh = new TimelineEvent();
     too_fresh->SetUID(user_id);
-    too_fresh->SetStartTime(time(0) - 60);  // started 1 minute ago
-    too_fresh->SetEndTime(time(0));  // lasted until now
+    too_fresh->SetStartTime(std::max<time_t>(now - 60, chunk_start));
+    too_fresh->SetEndTime(now);  // lasted until now
     too_fresh->SetFilename("Notepad.exe");
     too_fresh->SetTitle("notes");
     user.related.TimelineEvents.push_back(too_fresh);
 
-    // This event happened more than 7 days ago,
-    // so it must not be uploaded, just deleted
-    TimelineEvent *too_old = new TimelineEvent();
-    too_old->SetUID(user_id);
-    too_old->SetStartTime(time(0) - kTimelineSecondsToKeep - 1);  // 7 days ago
-    too_old->SetEndTime(too_old->EndTime() + 120);  // lasted 2 minutes
-    too_old->SetFilename("Notepad.exe");
-    too_old->SetTitle("diary");
-    user.related.TimelineEvents.push_back(too_old);
+    // This event happened more than 7 days ago but was never uploaded, so
+    // per 1.3 it must be KEPT (not deleted) and remain eligible for
+    // upload -- only events that were actually uploaded are pruned after
+    // kTimelineSecondsToKeep.
+    TimelineEvent *old_unuploaded = new TimelineEvent();
+    old_unuploaded->SetUID(user_id);
+    old_unuploaded->SetStartTime(now - kTimelineSecondsToKeep - 1);  // just over 7 days ago
+    old_unuploaded->SetEndTime(old_unuploaded->Start() + 120);  // lasted 2 minutes
+    old_unuploaded->SetFilename("Notepad.exe");
+    old_unuploaded->SetTitle("diary");
+    user.related.TimelineEvents.push_back(old_unuploaded);
+
+    // This event happened more than 7 days ago AND has already been
+    // uploaded, so it must still be deleted, same as before 1.3.
+    TimelineEvent *old_uploaded = new TimelineEvent();
+    old_uploaded->SetUID(user_id);
+    old_uploaded->SetStartTime(now - kTimelineSecondsToKeep - 2);  // just over 7 days ago
+    old_uploaded->SetEndTime(old_uploaded->Start() + 30);
+    old_uploaded->SetFilename("Notepad.exe");
+    old_uploaded->SetTitle("old and uploaded");
+    old_uploaded->SetUploaded(true);
+    user.related.TimelineEvents.push_back(old_uploaded);
 
     db.instance()->SaveUser(&user, true, &changes);
 
     user.CompressTimeline();
     std::vector<const TimelineEvent*> timeline_events = user.CompressedTimelineForUpload();
 
-    if (timeline_events.size() != 1) {
+    if (timeline_events.size() != 2) {
         std::cerr << "user.related.TimelineEvents:" << std::endl;
         for (std::vector<TimelineEvent *>::const_iterator it =
             user.related.TimelineEvents.begin();
@@ -220,7 +317,7 @@ TEST(User, CreateCompressedTimelineBatchForUpload) {
         }
     }
 
-    ASSERT_EQ(size_t(1), timeline_events.size());
+    ASSERT_EQ(size_t(2), timeline_events.size());
 
     // Compress some more, for fun and profit
     for (int i = 0; i < 100; i++) {
@@ -228,7 +325,7 @@ TEST(User, CreateCompressedTimelineBatchForUpload) {
         timeline_events = user.CompressedTimelineForUpload();
     }
 
-    ASSERT_EQ(size_t(1), timeline_events.size());
+    ASSERT_EQ(size_t(2), timeline_events.size());
 
     const TimelineEvent *ready_for_upload = timeline_events[0];
     ASSERT_TRUE(ready_for_upload->Chunked());
@@ -236,7 +333,7 @@ TEST(User, CreateCompressedTimelineBatchForUpload) {
 
     ASSERT_NE(good2->Start(), ready_for_upload->Start());
     ASSERT_NE(uploaded->Start(), ready_for_upload->Start());
-    ASSERT_NE(too_old->Start(), ready_for_upload->Start());
+    ASSERT_NE(old_unuploaded->Start(), ready_for_upload->Start());
     ASSERT_NE(too_fresh->Start(), ready_for_upload->Start());
     ASSERT_EQ(good->Start(), ready_for_upload->Start());
 
@@ -248,12 +345,80 @@ TEST(User, CreateCompressedTimelineBatchForUpload) {
     ASSERT_EQ(good->Idle(), ready_for_upload->Idle());
     ASSERT_FALSE(ready_for_upload->Uploaded());
 
-    // Fake that we have uploaded the chunked timeline event now
+    // The un-uploaded event older than kTimelineSecondsToKeep must have
+    // survived CompressTimeline() and be ready for upload too (1.3): it is
+    // never deleted just because it wasn't uploaded within 7 days.
+    const TimelineEvent *old_unuploaded_ready_for_upload = timeline_events[1];
+    ASSERT_FALSE(old_unuploaded_ready_for_upload->DeletedAt());
+    ASSERT_TRUE(old_unuploaded_ready_for_upload->Chunked());
+    ASSERT_EQ(old_unuploaded->Start(), old_unuploaded_ready_for_upload->Start());
+    ASSERT_EQ(old_unuploaded->Filename(), old_unuploaded_ready_for_upload->Filename());
+    ASSERT_EQ(old_unuploaded->Title(), old_unuploaded_ready_for_upload->Title());
+
+    // The old event that HAD been uploaded must still be deleted, exactly
+    // like before 1.3.
+    ASSERT_TRUE(old_uploaded->DeletedAt() > 0);
+
+    // Fake that we have uploaded the chunked timeline events now
     user.MarkTimelineBatchAsUploaded(timeline_events);
 
     // Now, no more events should exist for upload
     std::vector<const TimelineEvent*> left_for_upload = user.CompressedTimelineForUpload();
     ASSERT_EQ(std::size_t(0), left_for_upload.size());
+}
+
+TEST(User, CompressTimelineKeepsUnuploadedEventsUnderTheCeiling) {
+    // 1.3: an un-uploaded timeline event older than kTimelineSecondsToKeep
+    // (7 days) but well within the 90-day hard ceiling must not be deleted,
+    // so a temporary upload outage does not silently destroy activity data.
+    testing::Database db;
+
+    User user;
+    ASSERT_EQ(noError,
+              user.LoadUserAndRelatedDataFromJSONString(loadTestData(), true, false));
+
+    TimelineEvent *unuploaded = new TimelineEvent();
+    unuploaded->SetUID(user.ID());
+    unuploaded->SetStartTime(time(0) - kTimelineSecondsToKeep - 3600);  // 7 days + 1 hour ago
+    unuploaded->SetEndTime(unuploaded->Start() + 60);
+    unuploaded->SetFilename("Notepad.exe");
+    unuploaded->SetTitle("still waiting to upload");
+    user.related.TimelineEvents.push_back(unuploaded);
+
+    user.CompressTimeline();
+
+    ASSERT_FALSE(unuploaded->DeletedAt());
+}
+
+TEST(User, CompressTimelineEvictsUnuploadedEventsPastTheCeilingAndLogsIt) {
+    // 1.3: an un-uploaded timeline event older than the 90-day hard ceiling
+    // must be evicted regardless (so an account whose token is permanently
+    // revoked cannot grow the local DB without limit), and the eviction
+    // must be logged at warning.
+    testing::Database db;
+
+    User user;
+    ASSERT_EQ(noError,
+              user.LoadUserAndRelatedDataFromJSONString(loadTestData(), true, false));
+
+    TimelineEvent *ancient_unuploaded = new TimelineEvent();
+    ancient_unuploaded->SetUID(user.ID());
+    ancient_unuploaded->SetStartTime(time(0) - (91 * 24 * 60 * 60));  // 91 days ago
+    ancient_unuploaded->SetEndTime(ancient_unuploaded->Start() + 60);
+    ancient_unuploaded->SetFilename("Notepad.exe");
+    ancient_unuploaded->SetTitle("stuck forever");
+    user.related.TimelineEvents.push_back(ancient_unuploaded);
+
+    Poco::AutoPtr<testing::CapturingChannel> capture(new testing::CapturingChannel());
+    {
+        testing::ScopedLogChannel scoped_channel(
+            kModelUser, Poco::Channel::Ptr(capture));
+
+        user.CompressTimeline();
+    }
+
+    ASSERT_TRUE(ancient_unuploaded->DeletedAt() > 0);
+    ASSERT_TRUE(capture->anyMessageContains("Evicting"));
 }
 
 TEST(Database, Trim) {
@@ -1497,6 +1662,9 @@ TEST(JSON, LoginToken) {
 }
 
 TEST(JSON, ConvertTimelineToJSON) {
+    // POST /api/v9/timeline takes an array of models.TimelineEvent:
+    // desktop_id, start_time, end_time, filename, title, idle. The endpoint
+    // moved from v8 to v9 but the payload did not (plan.md 0.1).
     const std::string desktop_id("12345");
 
     TimelineEvent event;
@@ -1514,12 +1682,21 @@ TEST(JSON, ConvertTimelineToJSON) {
         ASSERT_EQ(std::size_t(1), root.size());
 
         const Json::Value v = root[0];
-        ASSERT_EQ("timeline", v["created_with"].asString());
         ASSERT_EQ(desktop_id, v["desktop_id"].asString());
-        ASSERT_EQ(Formatter::Format8601(event.Start()),
-                  v["start"].asString());
-        ASSERT_EQ(Formatter::Format8601(event.EndTime()),
-                  v["end"].asString());
+        ASSERT_EQ(event.Filename(), v["filename"].asString());
+        ASSERT_EQ(event.Title(), v["title"].asString());
+        ASSERT_EQ(event.Start(), v["start_time"].asInt64());
+        ASSERT_EQ(event.EndTime(), v["end_time"].asInt64());
+        ASSERT_TRUE(v["idle"].asBool());
+
+        // Fields that are not part of the v9 schema must not be sent.
+        ASSERT_FALSE(v.isMember("created_with"));
+        ASSERT_FALSE(v.isMember("guid"));
+        // The wrong shape that was briefly shipped must not come back.
+        ASSERT_FALSE(v.isMember("app_name"));
+        ASSERT_FALSE(v.isMember("window_title"));
+        ASSERT_FALSE(v.isMember("start"));
+        ASSERT_FALSE(v.isMember("end"));
     }
 
     event.SetIdle(false);
@@ -1532,14 +1709,8 @@ TEST(JSON, ConvertTimelineToJSON) {
         ASSERT_EQ(std::size_t(1), root.size());
 
         const Json::Value v = root[0];
-        ASSERT_EQ("timeline", v["created_with"].asString());
         ASSERT_EQ(desktop_id, v["desktop_id"].asString());
-        ASSERT_EQ(Formatter::Format8601(event.Start()),
-                  v["start"].asString());
-        ASSERT_EQ(Formatter::Format8601(event.EndTime()),
-                  v["end"].asString());
-        ASSERT_EQ(event.Filename(), v["app_name"].asString());
-        ASSERT_EQ(event.Title(), v["window_title"].asString());
+        ASSERT_FALSE(v["idle"].asBool());
     }
 
     event.SetTitle("Õhtu jõuab, päev veereb {\"\b\t");
@@ -1552,11 +1723,13 @@ TEST(JSON, ConvertTimelineToJSON) {
         ASSERT_EQ(std::size_t(1), root.size());
 
         const Json::Value v = root[0];
-        ASSERT_EQ(event.Title(), v["window_title"].asString());
+        ASSERT_EQ(event.Title(), v["title"].asString());
     }
 }
 
-TEST(JSON, ConvertTimelineToJSONUsesISO8601UTCTimestamps) {
+TEST(JSON, ConvertTimelineToJSONUsesEpochTimestamps) {
+    // v9's timeline payload kept the v8 epoch-second integers; it never
+    // switched to ISO 8601 strings the way most other v9 payloads did.
     const std::string desktop_id("12345");
 
     TimelineEvent event;
@@ -1564,6 +1737,7 @@ TEST(JSON, ConvertTimelineToJSONUsesISO8601UTCTimestamps) {
     event.SetEndTime(1469484060);    // 2016-07-25T22:01:00Z
     event.SetFilename("Google Chrome");
     event.SetTitle("Wireshark Packet Analysis - Stack Overflow");
+    event.SetIdle(true);
 
     std::vector<const TimelineEvent*> list;
     list.push_back(&event);
@@ -1573,39 +1747,46 @@ TEST(JSON, ConvertTimelineToJSONUsesISO8601UTCTimestamps) {
     ASSERT_EQ(std::size_t(1), root.size());
 
     const Json::Value v = root[0];
-    ASSERT_EQ("2016-07-25T22:00:00Z", v["start"].asString());
-    ASSERT_EQ("2016-07-25T22:01:00Z", v["end"].asString());
-    ASSERT_EQ("Google Chrome", v["app_name"].asString());
+    ASSERT_EQ(Json::Int64(1469484000), v["start_time"].asInt64());
+    ASSERT_EQ(Json::Int64(1469484060), v["end_time"].asInt64());
+    ASSERT_EQ("Google Chrome", v["filename"].asString());
     ASSERT_EQ("Wireshark Packet Analysis - Stack Overflow",
-              v["window_title"].asString());
-    // v8 field names must be gone
-    ASSERT_FALSE(v.isMember("start_time"));
-    ASSERT_FALSE(v.isMember("end_time"));
-    ASSERT_FALSE(v.isMember("filename"));
-    ASSERT_FALSE(v.isMember("title"));
+              v["title"].asString());
+    ASSERT_TRUE(v["idle"].asBool());
+
+    // The ISO-8601 + app_name/window_title shape that briefly shipped must
+    // be gone, along with the dropped guid/created_with fields.
+    ASSERT_FALSE(v.isMember("start"));
+    ASSERT_FALSE(v.isMember("end"));
+    ASSERT_FALSE(v.isMember("app_name"));
+    ASSERT_FALSE(v.isMember("window_title"));
+    ASSERT_FALSE(v.isMember("created_with"));
+    ASSERT_FALSE(v.isMember("guid"));
 }
 
-TEST(JSON, ConvertTimelineToJSONLegacyV8) {
-    const std::string desktop_id("12345");
-
+TEST(JSON, TimelineEventSaveToJSONIgnoresApiVersion) {
+    // The apiVersion branch has been collapsed entirely -- there is no v8
+    // to fall back to, so TimelineEvent::SaveToJSON must produce the same
+    // (correct) shape regardless of what is passed in.
     TimelineEvent event;
-    event.SetStartTime(time(0) - 10);
-    event.SetEndTime(time(0));
-    event.SetFilename("Is this the real life?");
-    event.SetTitle("Is this just fantasy?");
+    event.SetStartTime(1469484000);
+    event.SetEndTime(1469484060);
+    event.SetFilename("Google Chrome");
+    event.SetTitle("Wireshark Packet Analysis - Stack Overflow");
+    event.SetIdle(true);
 
-    std::vector<const TimelineEvent*> list;
-    list.push_back(&event);
-
-    Json::Value root = jsonStringToValue(
-        convertTimelineToJSON(list, desktop_id, 8));
-    ASSERT_EQ(std::size_t(1), root.size());
-
-    const Json::Value v = root[0];
-    ASSERT_EQ(event.Start(), v["start_time"].asUInt());
-    ASSERT_EQ(event.EndTime(), v["end_time"].asUInt());
-    ASSERT_EQ(event.Filename(), v["filename"].asString());
-    ASSERT_EQ(event.Title(), v["title"].asString());
+    for (int version : {8, 9, 42}) {
+        Json::Value v = event.SaveToJSON(version);
+        ASSERT_EQ(event.Filename(), v["filename"].asString());
+        ASSERT_EQ(event.Title(), v["title"].asString());
+        ASSERT_EQ(event.Start(), v["start_time"].asInt64());
+        ASSERT_EQ(event.EndTime(), v["end_time"].asInt64());
+        ASSERT_TRUE(v["idle"].asBool());
+        ASSERT_FALSE(v.isMember("created_with"));
+        ASSERT_FALSE(v.isMember("guid"));
+        ASSERT_FALSE(v.isMember("app_name"));
+        ASSERT_FALSE(v.isMember("window_title"));
+    }
 }
 
 TEST(JSON, Tag) {
@@ -1772,6 +1953,307 @@ TEST(User, DurationFormat) {
     u.SetDurationFormat("decimal");
     ASSERT_EQ("decimal", u.DurationFormat());
     ASSERT_EQ("decimal", Formatter::DurationFormat);
+}
+
+// Loads the v8-shaped testdata/me.json and the v9-shaped testdata/me_v9.json
+// (flat, no {"since":...,"data":{...}} envelope, no "since" field) into two
+// separate User objects and asserts the resulting in-memory model state is
+// identical field for field. me_v9.json was built by translating every
+// v8-only key in me.json to its v9 name (default_wid -> default_workspace_id,
+// wid -> workspace_id, cid -> client_id, pid -> project_id) while keeping
+// every value the same, so this test pins both branches of every
+// isMember("wid") ? ... : ... fork in user.cc, time_entry.cc, project.cc,
+// task.cc, client.cc and tag.cc against each other (plan.md 2.2). It is the
+// strongest available signal that the v9 read path is not half-migrated.
+//
+// Two fields are deliberately excluded from the comparison:
+//  - User::Since(): v9's /me response carries neither a top-level "since"
+//    nor "server_time" field (plan.md 1.1), so it is never expected to
+//    match v8's {"since":...} envelope. This is a known, already-documented
+//    gap, not something this test should paper over.
+//  - GUID on Project/TimeEntry: neither LoadFromJSON ever reads "guid" from
+//    the payload (it is only used to match an *existing* local model), and
+//    Project's constructor / TimeEntry's post-load EnsureGUID() calls fill
+//    it with a freshly generated random value for every new model. It is
+//    intentionally non-deterministic and would never match across two
+//    independently constructed User objects, v8/v9 or not.
+TEST(User, V8V9MeResponseParity) {
+    User v8;
+    ASSERT_EQ(noError,
+              v8.LoadUserAndRelatedDataFromJSONString(loadTestData(), true, false));
+
+    User v9;
+    ASSERT_EQ(noError,
+              v9.LoadUserAndRelatedDataFromJSONString(
+                  loadFromTestDataDir("me_v9.json"), true, false));
+
+    // --- User-level fields, including the default_wid/default_workspace_id fork ---
+    ASSERT_EQ(v8.ID(), v9.ID());
+    ASSERT_EQ(v8.APIToken(), v9.APIToken());
+    ASSERT_EQ(v8.Email(), v9.Email());
+    ASSERT_EQ(v8.Fullname(), v9.Fullname());
+    ASSERT_EQ(v8.DefaultWID(), v9.DefaultWID());
+    ASSERT_EQ(v8.RecordTimeline(), v9.RecordTimeline());
+    ASSERT_EQ(v8.TimeOfDayFormat(), v9.TimeOfDayFormat());
+    ASSERT_EQ(v8.BeginningOfWeek(), v9.BeginningOfWeek());
+
+    // --- Workspaces: not dual-shaped, but every field flows through the
+    //     same LoadUserAndRelatedDataFromJSON path so this doubles as an
+    //     end-to-end sanity check for the whole load. ---
+    ASSERT_EQ(v8.related.Workspaces.size(), v9.related.Workspaces.size());
+    for (size_t i = 0; i < v8.related.Workspaces.size(); i++) {
+        Workspace *a = v8.related.Workspaces[i];
+        Workspace *b = v9.related.Workspaces[i];
+        ASSERT_EQ(a->ID(), b->ID());
+        ASSERT_EQ(a->Name(), b->Name());
+        ASSERT_EQ(a->Premium(), b->Premium());
+        ASSERT_EQ(a->Admin(), b->Admin());
+        ASSERT_EQ(a->OnlyAdminsMayCreateProjects(), b->OnlyAdminsMayCreateProjects());
+        ASSERT_EQ(a->ProjectsBillableByDefault(), b->ProjectsBillableByDefault());
+        ASSERT_EQ(a->Business(), b->Business());
+    }
+
+    // --- Clients: wid/workspace_id fork (client.cc:48) ---
+    ASSERT_EQ(v8.related.Clients.size(), v9.related.Clients.size());
+    for (size_t i = 0; i < v8.related.Clients.size(); i++) {
+        Client *a = v8.related.Clients[i];
+        Client *b = v9.related.Clients[i];
+        ASSERT_EQ(a->ID(), b->ID());
+        ASSERT_EQ(a->Name(), b->Name());
+        ASSERT_EQ(a->WID(), b->WID());
+    }
+
+    // --- Projects: hex_color/color, wid/workspace_id, cid/client_id forks
+    //     (project.cc:111,119,123) ---
+    ASSERT_EQ(v8.related.Projects.size(), v9.related.Projects.size());
+    for (size_t i = 0; i < v8.related.Projects.size(); i++) {
+        Project *a = v8.related.Projects[i];
+        Project *b = v9.related.Projects[i];
+        ASSERT_EQ(a->ID(), b->ID());
+        ASSERT_EQ(a->Name(), b->Name());
+        ASSERT_EQ(a->WID(), b->WID());
+        ASSERT_EQ(a->CID(), b->CID());
+        ASSERT_EQ(a->Color(), b->Color());
+        ASSERT_EQ(a->Active(), b->Active());
+        ASSERT_EQ(a->Billable(), b->Billable());
+        ASSERT_EQ(a->ClientName(), b->ClientName());
+    }
+
+    // --- Tasks: pid/project_id, wid/workspace_id forks (task.cc:43,47) ---
+    ASSERT_EQ(v8.related.Tasks.size(), v9.related.Tasks.size());
+    for (size_t i = 0; i < v8.related.Tasks.size(); i++) {
+        Task *a = v8.related.Tasks[i];
+        Task *b = v9.related.Tasks[i];
+        ASSERT_EQ(a->ID(), b->ID());
+        ASSERT_EQ(a->Name(), b->Name());
+        ASSERT_EQ(a->WID(), b->WID());
+        ASSERT_EQ(a->PID(), b->PID());
+        ASSERT_EQ(a->Active(), b->Active());
+    }
+
+    // --- Tags: wid/workspace_id fork (tag.cc:35) ---
+    ASSERT_EQ(v8.related.Tags.size(), v9.related.Tags.size());
+    for (size_t i = 0; i < v8.related.Tags.size(); i++) {
+        Tag *a = v8.related.Tags[i];
+        Tag *b = v9.related.Tags[i];
+        ASSERT_EQ(a->ID(), b->ID());
+        ASSERT_EQ(a->Name(), b->Name());
+        ASSERT_EQ(a->WID(), b->WID());
+    }
+
+    // --- Time entries: wid/workspace_id fork (time_entry.cc:479) ---
+    ASSERT_EQ(v8.related.TimeEntries.size(), v9.related.TimeEntries.size());
+    for (size_t i = 0; i < v8.related.TimeEntries.size(); i++) {
+        TimeEntry *a = v8.related.TimeEntries[i];
+        TimeEntry *b = v9.related.TimeEntries[i];
+        ASSERT_EQ(a->ID(), b->ID());
+        ASSERT_EQ(a->WID(), b->WID());
+        ASSERT_EQ(a->PID(), b->PID());
+        ASSERT_EQ(a->TID(), b->TID());
+        ASSERT_EQ(a->Description(), b->Description());
+        ASSERT_EQ(a->Billable(), b->Billable());
+        ASSERT_EQ(a->DurationInSeconds(), b->DurationInSeconds());
+        ASSERT_EQ(a->StartTime(), b->StartTime());
+        ASSERT_EQ(a->StopTime(), b->StopTime());
+        ASSERT_EQ(a->DurOnly(), b->DurOnly());
+        ASSERT_EQ(a->Tags(), b->Tags());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Model URLs (plan.md 1.7, deferred here from W1-C).
+//
+// Every pushable model is workspace-scoped in v9. Bare /api/v9/tags and
+// /api/v9/tasks do not exist at all -- they 404 -- so these assertions pin the
+// exact paths rather than just "contains /api/v9".
+// ---------------------------------------------------------------------------
+
+TEST(ModelURL, TagIsWorkspaceScoped) {
+    Tag t;
+    t.SetWID(123456789);
+    ASSERT_EQ("/api/v9/workspaces/123456789/tags", t.ModelURL());
+}
+
+TEST(ModelURL, TaskIsWorkspaceScoped) {
+    Task t;
+    t.SetWID(123456789);
+    ASSERT_EQ("/api/v9/workspaces/123456789/tasks", t.ModelURL());
+}
+
+TEST(ModelURL, ClientIsWorkspaceScoped) {
+    Client c;
+    c.SetWID(123456789);
+    ASSERT_EQ("/api/v9/workspaces/123456789/clients", c.ModelURL());
+}
+
+TEST(ModelURL, ProjectIsWorkspaceScoped) {
+    Project p;
+    p.SetWID(123456789);
+    ASSERT_EQ("/api/v9/workspaces/123456789/projects", p.ModelURL());
+}
+
+TEST(ModelURL, TimeEntryIsWorkspaceScopedAndCarriesIDOnlyWhenKnown) {
+    TimeEntry t;
+    t.SetWID(123456789);
+    // No server-side ID yet -- this is the create (POST) URL.
+    ASSERT_EQ("/api/v9/workspaces/123456789/time_entries", t.ModelURL());
+
+    t.SetID(89818612);
+    // With an ID it becomes the update (PUT) / delete URL.
+    ASSERT_EQ("/api/v9/workspaces/123456789/time_entries/89818612",
+              t.ModelURL());
+}
+
+// ---------------------------------------------------------------------------
+// HTTP status code -> error mapping (plan.md 1.4, deferred here from W2-D).
+// ---------------------------------------------------------------------------
+
+TEST(HTTPClient, StatusCodeToErrorMapsSuccess) {
+    ASSERT_EQ(noError, HTTPClient::StatusCodeToError(200));
+    ASSERT_EQ(noError, HTTPClient::StatusCodeToError(201));
+    ASSERT_EQ(noError, HTTPClient::StatusCodeToError(202));
+}
+
+TEST(HTTPClient, StatusCodeToErrorMapsValidationRejections) {
+    // 422 used to fall through to kCannotConnectError, so a validation
+    // rejection was reported as "cannot connect" and retried forever.
+    ASSERT_EQ(error(kUnprocessableEntityError),
+              HTTPClient::StatusCodeToError(422));
+    ASSERT_EQ(error(kBadRequestError), HTTPClient::StatusCodeToError(400));
+    // The two must stay distinguishable -- 422 is not just an alias for 400.
+    ASSERT_NE(HTTPClient::StatusCodeToError(400),
+              HTTPClient::StatusCodeToError(422));
+}
+
+TEST(HTTPClient, StatusCodeToErrorMapsRateLimit) {
+    // 429 gets its own constant so IsNetworkingError() stops classifying
+    // successful throttling as being offline.
+    ASSERT_EQ(error(kRateLimit), HTTPClient::StatusCodeToError(429));
+}
+
+TEST(HTTPClient, StatusCodeToErrorMapsServerErrors) {
+    ASSERT_EQ(error(kBackendIsDownError), HTTPClient::StatusCodeToError(500));
+    ASSERT_EQ(error(kBackendIsDownError), HTTPClient::StatusCodeToError(502));
+    ASSERT_EQ(error(kBackendIsDownError), HTTPClient::StatusCodeToError(503));
+}
+
+TEST(HTTPClient, StatusCodeToErrorKeepsRedirectsAsCannotConnect) {
+    // REGRESSION GUARD, do not "improve" this mapping.
+    //
+    // HTTPClient::request detects a redirect with
+    //     kCannotConnectError == resp.err && isRedirect(resp.status_code)
+    // and only then retries against the Location header. Giving 3xx any other
+    // error constant silently disables redirect following -- which is how
+    // Context::fetchUpdates and the desktop_login flow reach their final URL.
+    ASSERT_EQ(error(kCannotConnectError), HTTPClient::StatusCodeToError(302));
+    ASSERT_EQ(error(kCannotConnectError), HTTPClient::StatusCodeToError(301));
+    ASSERT_EQ(error(kCannotConnectError), HTTPClient::StatusCodeToError(307));
+}
+
+TEST(Error, RateLimitAndValidationAreNotNetworkingErrors) {
+    // Both of these reached the server and got an authoritative answer.
+    ASSERT_FALSE(IsNetworkingError(error(kRateLimit)));
+    ASSERT_FALSE(IsNetworkingError(error(kUnprocessableEntityError)));
+
+    ASSERT_TRUE(IsNetworkingError(error(kCannotConnectError)));
+    ASSERT_TRUE(IsNetworkingError(error(kBackendIsDownError)));
+}
+
+TEST(Error, ValidationIsAUserErrorButRateLimitIsNot) {
+    // 422 is actionable by the user; 429 is not the user's problem and must
+    // not be shown as one.
+    ASSERT_TRUE(IsUserError(error(kUnprocessableEntityError)));
+    ASSERT_FALSE(IsUserError(error(kRateLimit)));
+}
+
+// ---------------------------------------------------------------------------
+// Log redaction (plan.md 2.5, deferred here from W2-D).
+//
+// Security-critical: SendFeedback attaches the raw log file, so anything that
+// reaches the log reaches Toggl support.
+// ---------------------------------------------------------------------------
+
+TEST(HTTPClient, RedactPayloadMasksTokensAndKeepsHarmlessFields) {
+    const std::string redacted = HTTPClient::RedactPayloadForLogging(
+        "{\"api_token\":\"x\",\"email\":\"a@b.c\"}");
+
+    ASSERT_EQ(std::string::npos, redacted.find("\"x\""));
+    ASSERT_NE(std::string::npos, redacted.find(kRedactedValuePlaceholder));
+    // The email is not a secret and is the single most useful thing in a
+    // support log, so it must survive.
+    ASSERT_NE(std::string::npos, redacted.find("a@b.c"));
+}
+
+TEST(HTTPClient, RedactPayloadWalksNestedStructures) {
+    // /me responses nest the token below the root, and the timeline payload is
+    // an array at the root. A shallow scrub would miss both.
+    const std::string nested = HTTPClient::RedactPayloadForLogging(
+        "{\"data\":[{\"api_token\":\"deadbeef\"}]}");
+    ASSERT_EQ(std::string::npos, nested.find("deadbeef"));
+    ASSERT_NE(std::string::npos, nested.find(kRedactedValuePlaceholder));
+
+    const std::string array_root = HTTPClient::RedactPayloadForLogging(
+        "[{\"filename\":\"Notepad.exe\",\"api_token\":\"deadbeef\"}]");
+    ASSERT_EQ(std::string::npos, array_root.find("deadbeef"));
+    ASSERT_NE(std::string::npos, array_root.find(kRedactedValuePlaceholder));
+    ASSERT_NE(std::string::npos, array_root.find("Notepad.exe"));
+}
+
+TEST(HTTPClient, RedactPayloadMasksPasswords) {
+    const std::string redacted = HTTPClient::RedactPayloadForLogging(
+        "{\"password\":\"hunter2\",\"current_password\":\"hunter1\"}");
+    ASSERT_EQ(std::string::npos, redacted.find("hunter2"));
+    ASSERT_EQ(std::string::npos, redacted.find("hunter1"));
+}
+
+TEST(HTTPClient, RedactPayloadSuppressesUnparseableSensitiveBodies) {
+    // Form-encoded, not JSON: there is no safe way to scrub it field by field,
+    // so it must be dropped whole rather than logged on a best-effort basis.
+    const std::string redacted =
+        HTTPClient::RedactPayloadForLogging("api_token=x&y=1");
+    ASSERT_EQ(std::string::npos, redacted.find("api_token=x"));
+    ASSERT_NE(std::string::npos, redacted.find("redacted"));
+}
+
+TEST(HTTPClient, RedactPayloadPassesThroughHarmlessNonJSON) {
+    const std::string harmless = "plain text, nothing secret here";
+    ASSERT_EQ(harmless, HTTPClient::RedactPayloadForLogging(harmless));
+
+    ASSERT_EQ("", HTTPClient::RedactPayloadForLogging(""));
+}
+
+TEST(HTTPClient, RedactPayloadTruncatesOversizedBodies) {
+    const std::string big(kMaxLoggedRequestBodyChars + 100, 'a');
+    const std::string redacted = HTTPClient::RedactPayloadForLogging(
+        big, kMaxLoggedRequestBodyChars);
+
+    ASSERT_NE(std::string::npos, redacted.find("...<truncated>"));
+    ASSERT_LT(redacted.size(), big.size());
+
+    // Under the limit nothing is touched.
+    const std::string small(16, 'a');
+    ASSERT_EQ(small, HTTPClient::RedactPayloadForLogging(
+                  small, kMaxLoggedRequestBodyChars));
 }
 
 TEST(Proxy, IsConfigured) {

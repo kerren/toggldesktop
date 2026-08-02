@@ -55,7 +55,11 @@ std::string Task::ModelName() const {
 }
 
 std::string Task::ModelURL() const {
-    return "/api/v9/tasks";
+    std::stringstream relative_url;
+    relative_url << "/api/v9/workspaces/"
+                 << WID() << "/tasks";
+
+    return relative_url.str();
 }
 
 }   // namespace toggl

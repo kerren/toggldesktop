@@ -12,7 +12,6 @@
 #include <json/json.h>  // NOLINT
 
 #include "const.h"
-#include "https_client.h"
 #include "platforminfo.h"
 #include "model/settings.h"
 #include "urls.h"
@@ -154,15 +153,19 @@ const std::string GoogleAnalyticsEvent::relativeURL() {
 }
 
 void GoogleAnalyticsEvent::runTask() {
-    HTTPRequest req;
-    req.host = "https://ssl.google-analytics.com";
-    req.relative_url = relativeURL();
-
-    HTTPResponse resp = TogglClient::GetInstance().silentGet(req);
-    if (resp.err != noError) {
-        Logger("Analytics").error(resp.err);
-        return;
-    }
+    // W2-E (plan.md 2b.1): Universal Analytics stopped processing data on
+    // 2023-07-01, so a "v=1" hit against a "UA-" property is silently
+    // discarded -- every one of these was already firing into a void.
+    // tid=UA-3215787-27 (see relativeURL()) is also Toggl's own analytics
+    // property, which a fork must not send events to even if UA were alive.
+    //
+    // The Analytics class interface is kept exactly as it was (see
+    // analytics.h) so all 31 analytics_.Track* call sites in context.cc
+    // continue to compile and run unchanged; this task now simply does
+    // nothing instead of making a dead HTTP request.
+    Logger("Analytics").debug(
+        "Google Analytics event dropped (dead upstream, see plan.md 2b.1): ",
+        category_, "/", action_);
 }
 
 const std::string GoogleAnalyticsSettingsEvent::relativeURL() {
@@ -321,15 +324,14 @@ void GoogleAnalyticsSettingsEvent::setActionString(const std::string &type,
 }
 
 void GoogleAnalyticsSettingsEvent::makeReq() {
-    HTTPRequest req;
-    req.host = "https://ssl.google-analytics.com";
-    req.relative_url = relativeURL();
-
-    HTTPResponse resp = TogglClient::GetInstance().silentGet(req);
-    if (resp.err != noError) {
-        Logger("Analytics").error(resp.err);
-        return;
-    }
+    // W2-E (plan.md 2b.1): no-op -- see GoogleAnalyticsEvent::runTask()
+    // above for the full rationale (dead Universal Analytics property,
+    // and it is Toggl's own property regardless). runTask() above still
+    // calls this once per tracked setting; that is harmless string
+    // formatting now that it no longer reaches the network.
+    Logger("Analytics").debug(
+        "Google Analytics settings event dropped (dead upstream, see plan.md 2b.1): ",
+        action_);
 }
 
 void Analytics::TrackStartTimeEntry(const std::string &client_id, const std::string& os, const uint8_t tab_index) {

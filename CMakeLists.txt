@@ -49,14 +49,21 @@ endif()
 include(FindPkgConfig)
 
 # Look for Qt
-find_package(Qt5Widgets CONFIG REQUIRED)
-find_package(Qt5DBus CONFIG REQUIRED)
-find_package(Qt5Network CONFIG REQUIRED)
-find_package(Qt5NetworkAuth CONFIG REQUIRED)
-# We need to include private headers manually
-include_directories( ${Qt5Widgets_PRIVATE_INCLUDE_DIRS} )
-if (UNIX AND NOT APPLE)
-    find_package(Qt5X11Extras CONFIG REQUIRED)
+# Neither TogglDesktopLibrary nor TogglAppTest links Qt - only the GUI
+# targets under src/ui do. Gate the (slow) Qt5 discovery behind an option so
+# a headless/CI build that only needs those two targets can skip it. Default
+# stays ON so the normal GUI build behaves exactly as before.
+option(TOGGL_REQUIRE_QT "Search for Qt5 (required to build the GUI targets)" ON)
+if(TOGGL_REQUIRE_QT)
+    find_package(Qt5Widgets CONFIG REQUIRED)
+    find_package(Qt5DBus CONFIG REQUIRED)
+    find_package(Qt5Network CONFIG REQUIRED)
+    find_package(Qt5NetworkAuth CONFIG REQUIRED)
+    # We need to include private headers manually
+    include_directories( ${Qt5Widgets_PRIVATE_INCLUDE_DIRS} )
+    if (UNIX AND NOT APPLE)
+        find_package(Qt5X11Extras CONFIG REQUIRED)
+    endif()
 endif()
 
 if(NOT USE_BUNDLED_LIBRARIES)
@@ -97,4 +104,15 @@ add_subdirectory(src)
 if (TOGGL_BUILD_TESTS)
     add_subdirectory(src/test)
 endif()
-add_subdirectory(src/ui/linux/TogglDesktop)
+# The Linux GUI links Qt5::Widgets and friends directly, so it can only be
+# configured when Qt5 discovery actually ran.
+#
+# NOTE: gating this is necessary but NOT sufficient for a headless build.
+# third_party/CMakeLists.txt still builds Qxt and Bugsnag unconditionally and
+# links them against Qt5::Core/Qt5::Widgets, so configuring with
+# TOGGL_REQUIRE_QT=OFF on a machine that has no Qt5 installed still fails at
+# the generate step. Gating those two vendored targets as well is the
+# remaining work before CI can skip installing Qt (plan.md 2.1).
+if(TOGGL_REQUIRE_QT)
+    add_subdirectory(src/ui/linux/TogglDesktop)
+endif()

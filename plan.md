@@ -247,6 +247,24 @@ unrecognised 4xx body currently pins the entry as permanently unsynced with no
 recovery path and no log line naming the unmatched string. Log the unmatched body
 at warning and cap retries so one bad entry cannot wedge the push queue forever.
 
+**Status after W3-G (2026-08-02) — partially done:**
+
+- *Done:* `TimeEntry::ResolveError` now logs the unmatched body verbatim at
+  warning before returning false. This is the half that unblocks Phase 3 item 6
+  — the unmatched v9 wording was previously undiscoverable, so there was nothing
+  to diff the string table against.
+- *Done:* the string table was deliberately **left untouched**. Do not guess at
+  v9 wordings; wait for real captured bodies.
+- *NOT done — the retry cap.* It needs a decision this plan has not made: where
+  the counter lives and when it resets. A per-entry counter needs somewhere to
+  persist, and the obvious home is a new column on the time-entry table, i.e. a
+  SQLite schema migration — too large to attach to this slice, and risky on the
+  primary write path. An in-memory counter avoids the migration but resets every
+  restart, which bounds wedging per session rather than permanently. Neither is
+  obviously right without knowing how often unmatched bodies actually occur,
+  which is precisely what the new warning log is there to measure. **Recommend
+  shipping the log first, reading real logs, then sizing the cap.**
+
 ### 1.7 Bare `/tags` and `/tasks` do not exist in v9 (~1h)
 
 `Tag::ModelURL()` (`src/model/tag.cc:45`) and `Task::ModelURL()`
@@ -485,15 +503,46 @@ Cannot be done from the dev container: egress blocks `toggl.com` hosts, and
    (see 1.6).
 7. Start a timer and confirm v9 accepts a **negative-epoch** duration, not just
    `-1` (see 1.9).
+
+   *Confirmed by code inspection in W1-C (2026-08-01), encoding deliberately
+   left unchanged:* running entries are sent as `duration = -start`, i.e. the
+   negated Unix epoch seconds of the start time — exactly the v8 convention.
+   There are **two** sites, not one: `TimeEntry::SetStartUserInput`
+   (`src/model/time_entry.cc:307`) and `TimeEntry::SetDurationUserInput`
+   (`:334`), the latter reaching the same state via
+   `SetStartTime` + `SetDurationInSeconds(-start, true)`. Both now carry a
+   comment recording that this is pending live verification. `-start` is
+   genuinely negative so it should satisfy v9's "negative duration" rule, but
+   this is an untested assumption on the app's most important write path.
+   **Test:** start a timer against v9 and confirm the negative-epoch value is
+   accepted, not just `-1`.
 8. Does `GET /me?with_related_data=true` return the full time-entry history or a
    bounded window? v8 returned everything. If v9 bounds it, first sync after login
    shows fewer entries than users expect, and 1.1 stops being optional.
 9. Confirm the observed 429 threshold and whether any `Retry-After`-equivalent
    header is sent — sizes the token bucket in 1.8.
+
+   *W2-D (2026-08-01) sized the client-side pacer on an unverified assumption.*
+   `kMinRequestIntervalMillis` is **1000 ms**, taken directly from the documented
+   "~1 req/s per token+IP" figure with **no safety margin** — the client runs at
+   100% of the stated budget, so clock jitter or reordering can still produce a
+   429. If live testing shows 429s continuing under normal sync load, raise it to
+   1100-1200 ms. If the real limit is higher than 1/s, lowering it makes large
+   pushes much faster. Also unverified: whether v9 sends **any**
+   `Retry-After`-equivalent header. The client parses `Retry-After` as integer
+   seconds (capped at 300s) and falls back to incremental backoff when absent —
+   confirm the header name and format, since a differently-named header (e.g.
+   `X-RateLimit-Reset`) would be silently ignored.
 10. `desktop.track.toggl.com/stream` still accepts the websocket upgrade
     (`src/websocket_client.cc:125`). Failure is silent and permanent: it retries
     every 45s forever and degrades to ~15-30 minute polling with no user-visible
     error.
+11. **Confirm v9 uses 422 for validation rejections, and capture a real 422 body.**
+    W2-D added explicit 422 handling on the assumption that v9 returns 422 (not
+    400) for validation failures; the spec was not re-fetchable from the
+    container. If v9 actually uses 400, the `kUnprocessableEntityError` path is
+    dead code and existing 400 handling already covers it. If it uses both, the
+    two must behave identically at the push call site (`context.cc` — see W2-E).
 
 `src/test/online_test.cc` is an existing live end-to-end suite (23 tests; signs up
 a throwaway user, creates entries and projects) that nothing currently runs. It is

@@ -42,7 +42,11 @@ std::string Tag::ModelName() const {
 }
 
 std::string Tag::ModelURL() const {
-    return "/api/v9/tags";
+    std::stringstream relative_url;
+    relative_url << "/api/v9/workspaces/"
+                 << WID() << "/tags";
+
+    return relative_url.str();
 }
 
 }   // namespace toggl
