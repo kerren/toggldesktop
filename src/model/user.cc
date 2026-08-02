@@ -1203,7 +1203,17 @@ error User::UserID(
     if (!ok) {
         return error("error parsing UserID JSON");
     }
-    *result = root["data"]["id"].asUInt64();
+    // legacy API sends the data in a "data" nested member; v9's /me and
+    // /signup return the user flat. Unwrap the same way
+    // LoadUserAndRelatedDataFromJSON does so both shapes resolve to the
+    // same node.
+    const Json::Value &data { root.isMember("data") ? root["data"] : root };
+    // ...and fall back to user_id like loadUserFromJSON, for the payloads
+    // that name the field that way.
+    *result = data["id"].asUInt64();
+    if (!*result) {
+        *result = data["user_id"].asUInt64();
+    }
     return noError;
 }
 

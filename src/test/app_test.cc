@@ -1647,11 +1647,43 @@ TEST(JSON, EscapeJSONString) {
     ASSERT_EQ(" ", Formatter::EscapeJSONString("\t"));
 }
 
+// Context::SetLoggedInUserFromJSON gates the whole login on this returning a
+// non-zero ID, so it has to accept every shape the backend actually replies
+// with. v8 wrapped the user in {"data":{...}}; v9's GET /me and POST /signup
+// return it flat, and reading root["data"]["id"] out of a flat response
+// silently yields 0 -- which surfaces as "missing user ID in JSON" and blocks
+// login outright.
 TEST(JSON, UserID) {
     Poco::UInt64 user_id(0);
     ASSERT_EQ(noError,
               User::UserID("{\"data\": {\"id\": 12345}}", &user_id));
     ASSERT_EQ(Poco::UInt64(12345), user_id);
+
+    // v9: flat, no "data" wrapper
+    user_id = 0;
+    ASSERT_EQ(noError, User::UserID("{\"id\": 12345}", &user_id));
+    ASSERT_EQ(Poco::UInt64(12345), user_id);
+
+    // payloads naming the field user_id, as loadUserFromJSON also accepts
+    user_id = 0;
+    ASSERT_EQ(noError, User::UserID("{\"user_id\": 12345}", &user_id));
+    ASSERT_EQ(Poco::UInt64(12345), user_id);
+
+    // no ID anywhere is still reported as absent, not as a parse failure
+    user_id = 0;
+    ASSERT_EQ(noError, User::UserID("{\"email\": \"foo@bar.com\"}", &user_id));
+    ASSERT_EQ(Poco::UInt64(0), user_id);
+
+    // the real v9 /me fixture must resolve, or login is broken
+    user_id = 0;
+    ASSERT_EQ(noError,
+              User::UserID(loadFromTestDataDir("me_v9.json"), &user_id));
+    ASSERT_NE(Poco::UInt64(0), user_id);
+
+    // ...and so must the v8 one
+    Poco::UInt64 v8_user_id(0);
+    ASSERT_EQ(noError, User::UserID(loadTestData(), &v8_user_id));
+    ASSERT_EQ(v8_user_id, user_id);
 }
 
 TEST(JSON, LoginToken) {
