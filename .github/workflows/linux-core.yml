@@ -18,20 +18,24 @@ jobs:
         with:
           fetch-depth: 1
 
-      # Verified recipe, plan.md 2.1. Qt5 is installed here because
-      # find_package(Qt5... REQUIRED) in the root CMakeLists.txt is
-      # unconditional by default (TOGGL_REQUIRE_QT defaults to ON) even
-      # though neither target built below links Qt.
+      # Neither TogglDesktopLibrary nor TogglAppTest links Qt, so this job
+      # builds with TOGGL_REQUIRE_QT=OFF and does not install Qt5 at all -
+      # that option gates both the find_package(Qt5... REQUIRED) calls and
+      # the add_subdirectory for the Linux GUI, which is the only thing that
+      # actually needs Qt. Verified headless: configures, builds and passes.
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            qtbase5-dev qtbase5-private-dev libqt5x11extras5-dev \
-            libqt5networkauth5-dev libssl-dev libpoco-dev libjsoncpp-dev \
+            libssl-dev libpoco-dev libjsoncpp-dev \
             libxmu-dev libxss-dev cmake build-essential pkg-config
 
       - name: Configure (system Poco/OpenSSL/jsoncpp, not vendored)
-        run: cmake -S . -B build -DTOGGL_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+        run: |
+          cmake -S . -B build \
+            -DTOGGL_BUILD_TESTS=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTOGGL_REQUIRE_QT=OFF
 
       # Build ONLY these two targets. TOGGL_BUILD_TESTS=ON also defines
       # TogglApiTest and TogglOnlineTest (src/test/CMakeLists.txt), and both

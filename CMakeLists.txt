@@ -104,4 +104,11 @@ add_subdirectory(src)
 if (TOGGL_BUILD_TESTS)
     add_subdirectory(src/test)
 endif()
-add_subdirectory(src/ui/linux/TogglDesktop)
+# The Linux GUI links Qt5::Widgets and friends directly, so it can only be
+# configured when Qt5 discovery actually ran. Gating it on the same option is
+# what makes TOGGL_REQUIRE_QT=OFF usable: a headless build (CI running only
+# TogglDesktopLibrary and TogglAppTest, neither of which links Qt) can then
+# skip installing Qt entirely.
+if(TOGGL_REQUIRE_QT)
+    add_subdirectory(src/ui/linux/TogglDesktop)
+endif()
