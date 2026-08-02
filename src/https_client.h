@@ -27,6 +27,27 @@ class Context;
 } // namespace Poco::Net
 } // namespace Poco
 
+// ---------------------------------------------------------------------------
+// Test-only HTTP seam (plan.md 2.4).
+//
+// TOGGL_TEST_HTTP_SEAM is defined by src/test/CMakeLists.txt, on
+// TogglDesktopLibrary itself (PUBLIC, so every consumer of the library sees the
+// same class layout), and *only* when TOGGL_PRODUCTION_BUILD is OFF. A shipping
+// build therefore never defines it, and every seam member below disappears at
+// preprocessing time: TogglClient::GetInstance() is byte-for-byte the original
+// Meyers singleton, there is no extra static, no branch and no extra member.
+//
+// The definition must be identical in every translation unit that includes this
+// header, otherwise TogglClient would have two different definitions (ODR) and
+// the inlined GetInstance() in context.cc would not see the seam at all. That is
+// why it is set on the library target rather than on the test executables.
+//
+// Belt and braces: refuse to compile if the two are ever combined.
+// ---------------------------------------------------------------------------
+#if defined(TOGGL_TEST_HTTP_SEAM) && defined(TOGGL_PRODUCTION_BUILD)
+#error "TOGGL_TEST_HTTP_SEAM must never be enabled in a production build"
+#endif
+
 namespace toggl {
 
 class TOGGL_INTERNAL_EXPORT ServerStatus {
@@ -254,8 +275,33 @@ class TOGGL_INTERNAL_EXPORT TogglClient : public HTTPClient {
     static ServerStatus TogglStatus;
     static TogglClient& GetInstance() {
         static TogglClient instance; // static is thread-safe in C++11.
+#ifdef TOGGL_TEST_HTTP_SEAM
+        // Test-only (plan.md 2.4). Null unless a test explicitly installs a
+        // stand-in, so even with the seam compiled in the default behaviour is
+        // identical to a release build.
+        if (test_seam_) {
+            return *test_seam_;
+        }
+#endif
         return instance;
     }
+
+#ifdef TOGGL_TEST_HTTP_SEAM
+    // Install (or, with nullptr, remove) the TogglClient that every
+    // TogglClient::GetInstance() call site in the app will use from now on.
+    // The stand-in is a subclass overriding the already-virtual
+    // HTTPClient::makeHttpRequest, so it can record the outgoing HTTPRequest
+    // and answer with a canned v9 response without any socket being opened.
+    //
+    // Not thread-safe by design: tests install the seam before driving the
+    // code under test and remove it afterwards.
+    static void SetTestSeam(TogglClient *seam) {
+        test_seam_ = seam;
+    }
+    static TogglClient *TestSeam() {
+        return test_seam_;
+    }
+#endif
 
     void SetSyncStateMonitor(SyncStateMonitor *monitor = nullptr) {
         monitor_ = monitor;
@@ -300,9 +346,24 @@ class TOGGL_INTERNAL_EXPORT TogglClient : public HTTPClient {
     virtual HTTPResponse request(HTTPRequest req, bool_t loggingOn = true) const override;
     virtual Logger logger() const override;
 
+#ifdef TOGGL_TEST_HTTP_SEAM
+    // Test stand-ins derive from TogglClient, so the constructor has to be
+    // reachable by a subclass while the seam is compiled in. Without the seam
+    // it stays private, exactly as it always was.
+ protected:
+#else
  private:
+#endif
     TogglClient() {};
+
+ private:
     SyncStateMonitor *monitor_;
+
+#ifdef TOGGL_TEST_HTTP_SEAM
+    // C++17 inline static: no definition needed in https_client.cc, which
+    // keeps the whole seam inside this header.
+    inline static TogglClient *test_seam_ = nullptr;
+#endif
 };
 
 }  // namespace toggl

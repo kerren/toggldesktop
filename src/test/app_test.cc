@@ -2,12 +2,16 @@
 
 #include "gtest/gtest.h"
 
+#include <algorithm>
+#include <ctime>
 #include <iostream>  // NOLINT
 
 #include "model/autotracker.h"
 #include "model/client.h"
 #include "const.h"
 #include "database/database.h"
+#include "error.h"
+#include "https_client.h"
 #include "util/formatter.h"
 #include "model/project.h"
 #include "proxy.h"
@@ -187,14 +191,36 @@ TEST(User, CreateCompressedTimelineBatchForUpload) {
 
     std::vector<ModelChange> changes;
 
+    // Everything in this test is positioned relative to the 15 minute chunk
+    // grid that User::CompressTimeline works on, NOT to "n seconds ago".
+    // Wall-clock-relative offsets make this test flaky, because whether two
+    // offsets share a chunk depends on where in the current chunk the test
+    // happens to run. See the two comments below for the specific traps.
+    const time_t now = time(0);
+    const time_t chunk_start =
+        (now / kTimelineChunkSeconds) * kTimelineChunkSeconds;
+
     Poco::UInt64 good_duration_seconds(30);
 
     // Event that happened at least 15 minutes ago,
     // can be uploaded to Toggl backend.
+    //
+    // `good`, `good2` and `uploaded` below must all land in the SAME chunk:
+    // CompressTimeline keys chunks on filename/title/idle plus the chunk start
+    // time, so a chunk boundary falling between them produces two chunks and
+    // the expected count of 2 further down becomes 3.
+    //
+    // Do NOT write `time(0) - 86400 - 60*16` here. 86400 is a whole number of
+    // chunks, so that offset sits 60 seconds before a chunk boundary relative
+    // to `now`, and `good2` starts 31 seconds after `good` ends -- which puts
+    // the two in different chunks whenever now % 900 is in [29, 60). Anchoring
+    // `good` to a chunk boundary a day back makes their ~1 minute span fit
+    // inside one chunk at every wall-clock time.
     TimelineEvent *good = new TimelineEvent();
     good->SetUID(user_id);
-    // started yesterday, "16 minutes ago"
-    good->SetStartTime(time(0) - 86400 - 60*16);
+    // started yesterday, at the start of a 15 minute chunk
+    good->SetStartTime(
+        ((now - 86400) / kTimelineChunkSeconds) * kTimelineChunkSeconds);
     good->SetEndTime(good->Start() + good_duration_seconds);
     good->SetFilename("Notepad.exe");
     good->SetTitle("untitled");
@@ -223,12 +249,24 @@ TEST(User, CreateCompressedTimelineBatchForUpload) {
     uploaded->SetUploaded(true);
     user.related.TimelineEvents.push_back(uploaded);
 
-    // This event happened less than 15 minutes ago,
-    // so it must not be uploaded
+    // This event belongs to the *current*, still incomplete 15 minute chunk,
+    // so it must not be uploaded.
+    //
+    // Do NOT write `time(0) - 60` here. User::CompressTimeline only compresses
+    // events whose Start() is strictly below the current chunk boundary
+    // `(now / kTimelineChunkSeconds) * kTimelineChunkSeconds`
+    // (src/model/user.cc). During the first 60 seconds of any 15 minute chunk
+    // `now - 60` lands in the *previous* chunk and this event gets compressed
+    // after all -- a real ~6.7% (60s in every 900s) flake that has nothing to
+    // do with the code under test. Clamping the start to the chunk boundary
+    // keeps the event inside the current chunk at every wall-clock time.
+    //
+    // std::max is correct on the boundary itself: when now % 900 == 0 the
+    // start equals chunk_start, and the compression check is a strict `<`.
     TimelineEvent *too_fresh = new TimelineEvent();
     too_fresh->SetUID(user_id);
-    too_fresh->SetStartTime(time(0) - 60);  // started 1 minute ago
-    too_fresh->SetEndTime(time(0));  // lasted until now
+    too_fresh->SetStartTime(std::max<time_t>(now - 60, chunk_start));
+    too_fresh->SetEndTime(now);  // lasted until now
     too_fresh->SetFilename("Notepad.exe");
     too_fresh->SetTitle("notes");
     user.related.TimelineEvents.push_back(too_fresh);
@@ -239,7 +277,7 @@ TEST(User, CreateCompressedTimelineBatchForUpload) {
     // kTimelineSecondsToKeep.
     TimelineEvent *old_unuploaded = new TimelineEvent();
     old_unuploaded->SetUID(user_id);
-    old_unuploaded->SetStartTime(time(0) - kTimelineSecondsToKeep - 1);  // just over 7 days ago
+    old_unuploaded->SetStartTime(now - kTimelineSecondsToKeep - 1);  // just over 7 days ago
     old_unuploaded->SetEndTime(old_unuploaded->Start() + 120);  // lasted 2 minutes
     old_unuploaded->SetFilename("Notepad.exe");
     old_unuploaded->SetTitle("diary");
@@ -249,7 +287,7 @@ TEST(User, CreateCompressedTimelineBatchForUpload) {
     // uploaded, so it must still be deleted, same as before 1.3.
     TimelineEvent *old_uploaded = new TimelineEvent();
     old_uploaded->SetUID(user_id);
-    old_uploaded->SetStartTime(time(0) - kTimelineSecondsToKeep - 2);  // just over 7 days ago
+    old_uploaded->SetStartTime(now - kTimelineSecondsToKeep - 2);  // just over 7 days ago
     old_uploaded->SetEndTime(old_uploaded->Start() + 30);
     old_uploaded->SetFilename("Notepad.exe");
     old_uploaded->SetTitle("old and uploaded");
@@ -2040,6 +2078,182 @@ TEST(User, V8V9MeResponseParity) {
         ASSERT_EQ(a->DurOnly(), b->DurOnly());
         ASSERT_EQ(a->Tags(), b->Tags());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Model URLs (plan.md 1.7, deferred here from W1-C).
+//
+// Every pushable model is workspace-scoped in v9. Bare /api/v9/tags and
+// /api/v9/tasks do not exist at all -- they 404 -- so these assertions pin the
+// exact paths rather than just "contains /api/v9".
+// ---------------------------------------------------------------------------
+
+TEST(ModelURL, TagIsWorkspaceScoped) {
+    Tag t;
+    t.SetWID(123456789);
+    ASSERT_EQ("/api/v9/workspaces/123456789/tags", t.ModelURL());
+}
+
+TEST(ModelURL, TaskIsWorkspaceScoped) {
+    Task t;
+    t.SetWID(123456789);
+    ASSERT_EQ("/api/v9/workspaces/123456789/tasks", t.ModelURL());
+}
+
+TEST(ModelURL, ClientIsWorkspaceScoped) {
+    Client c;
+    c.SetWID(123456789);
+    ASSERT_EQ("/api/v9/workspaces/123456789/clients", c.ModelURL());
+}
+
+TEST(ModelURL, ProjectIsWorkspaceScoped) {
+    Project p;
+    p.SetWID(123456789);
+    ASSERT_EQ("/api/v9/workspaces/123456789/projects", p.ModelURL());
+}
+
+TEST(ModelURL, TimeEntryIsWorkspaceScopedAndCarriesIDOnlyWhenKnown) {
+    TimeEntry t;
+    t.SetWID(123456789);
+    // No server-side ID yet -- this is the create (POST) URL.
+    ASSERT_EQ("/api/v9/workspaces/123456789/time_entries", t.ModelURL());
+
+    t.SetID(89818612);
+    // With an ID it becomes the update (PUT) / delete URL.
+    ASSERT_EQ("/api/v9/workspaces/123456789/time_entries/89818612",
+              t.ModelURL());
+}
+
+// ---------------------------------------------------------------------------
+// HTTP status code -> error mapping (plan.md 1.4, deferred here from W2-D).
+// ---------------------------------------------------------------------------
+
+TEST(HTTPClient, StatusCodeToErrorMapsSuccess) {
+    ASSERT_EQ(noError, HTTPClient::StatusCodeToError(200));
+    ASSERT_EQ(noError, HTTPClient::StatusCodeToError(201));
+    ASSERT_EQ(noError, HTTPClient::StatusCodeToError(202));
+}
+
+TEST(HTTPClient, StatusCodeToErrorMapsValidationRejections) {
+    // 422 used to fall through to kCannotConnectError, so a validation
+    // rejection was reported as "cannot connect" and retried forever.
+    ASSERT_EQ(error(kUnprocessableEntityError),
+              HTTPClient::StatusCodeToError(422));
+    ASSERT_EQ(error(kBadRequestError), HTTPClient::StatusCodeToError(400));
+    // The two must stay distinguishable -- 422 is not just an alias for 400.
+    ASSERT_NE(HTTPClient::StatusCodeToError(400),
+              HTTPClient::StatusCodeToError(422));
+}
+
+TEST(HTTPClient, StatusCodeToErrorMapsRateLimit) {
+    // 429 gets its own constant so IsNetworkingError() stops classifying
+    // successful throttling as being offline.
+    ASSERT_EQ(error(kRateLimit), HTTPClient::StatusCodeToError(429));
+}
+
+TEST(HTTPClient, StatusCodeToErrorMapsServerErrors) {
+    ASSERT_EQ(error(kBackendIsDownError), HTTPClient::StatusCodeToError(500));
+    ASSERT_EQ(error(kBackendIsDownError), HTTPClient::StatusCodeToError(502));
+    ASSERT_EQ(error(kBackendIsDownError), HTTPClient::StatusCodeToError(503));
+}
+
+TEST(HTTPClient, StatusCodeToErrorKeepsRedirectsAsCannotConnect) {
+    // REGRESSION GUARD, do not "improve" this mapping.
+    //
+    // HTTPClient::request detects a redirect with
+    //     kCannotConnectError == resp.err && isRedirect(resp.status_code)
+    // and only then retries against the Location header. Giving 3xx any other
+    // error constant silently disables redirect following -- which is how
+    // Context::fetchUpdates and the desktop_login flow reach their final URL.
+    ASSERT_EQ(error(kCannotConnectError), HTTPClient::StatusCodeToError(302));
+    ASSERT_EQ(error(kCannotConnectError), HTTPClient::StatusCodeToError(301));
+    ASSERT_EQ(error(kCannotConnectError), HTTPClient::StatusCodeToError(307));
+}
+
+TEST(Error, RateLimitAndValidationAreNotNetworkingErrors) {
+    // Both of these reached the server and got an authoritative answer.
+    ASSERT_FALSE(IsNetworkingError(error(kRateLimit)));
+    ASSERT_FALSE(IsNetworkingError(error(kUnprocessableEntityError)));
+
+    ASSERT_TRUE(IsNetworkingError(error(kCannotConnectError)));
+    ASSERT_TRUE(IsNetworkingError(error(kBackendIsDownError)));
+}
+
+TEST(Error, ValidationIsAUserErrorButRateLimitIsNot) {
+    // 422 is actionable by the user; 429 is not the user's problem and must
+    // not be shown as one.
+    ASSERT_TRUE(IsUserError(error(kUnprocessableEntityError)));
+    ASSERT_FALSE(IsUserError(error(kRateLimit)));
+}
+
+// ---------------------------------------------------------------------------
+// Log redaction (plan.md 2.5, deferred here from W2-D).
+//
+// Security-critical: SendFeedback attaches the raw log file, so anything that
+// reaches the log reaches Toggl support.
+// ---------------------------------------------------------------------------
+
+TEST(HTTPClient, RedactPayloadMasksTokensAndKeepsHarmlessFields) {
+    const std::string redacted = HTTPClient::RedactPayloadForLogging(
+        "{\"api_token\":\"x\",\"email\":\"a@b.c\"}");
+
+    ASSERT_EQ(std::string::npos, redacted.find("\"x\""));
+    ASSERT_NE(std::string::npos, redacted.find(kRedactedValuePlaceholder));
+    // The email is not a secret and is the single most useful thing in a
+    // support log, so it must survive.
+    ASSERT_NE(std::string::npos, redacted.find("a@b.c"));
+}
+
+TEST(HTTPClient, RedactPayloadWalksNestedStructures) {
+    // /me responses nest the token below the root, and the timeline payload is
+    // an array at the root. A shallow scrub would miss both.
+    const std::string nested = HTTPClient::RedactPayloadForLogging(
+        "{\"data\":[{\"api_token\":\"deadbeef\"}]}");
+    ASSERT_EQ(std::string::npos, nested.find("deadbeef"));
+    ASSERT_NE(std::string::npos, nested.find(kRedactedValuePlaceholder));
+
+    const std::string array_root = HTTPClient::RedactPayloadForLogging(
+        "[{\"filename\":\"Notepad.exe\",\"api_token\":\"deadbeef\"}]");
+    ASSERT_EQ(std::string::npos, array_root.find("deadbeef"));
+    ASSERT_NE(std::string::npos, array_root.find(kRedactedValuePlaceholder));
+    ASSERT_NE(std::string::npos, array_root.find("Notepad.exe"));
+}
+
+TEST(HTTPClient, RedactPayloadMasksPasswords) {
+    const std::string redacted = HTTPClient::RedactPayloadForLogging(
+        "{\"password\":\"hunter2\",\"current_password\":\"hunter1\"}");
+    ASSERT_EQ(std::string::npos, redacted.find("hunter2"));
+    ASSERT_EQ(std::string::npos, redacted.find("hunter1"));
+}
+
+TEST(HTTPClient, RedactPayloadSuppressesUnparseableSensitiveBodies) {
+    // Form-encoded, not JSON: there is no safe way to scrub it field by field,
+    // so it must be dropped whole rather than logged on a best-effort basis.
+    const std::string redacted =
+        HTTPClient::RedactPayloadForLogging("api_token=x&y=1");
+    ASSERT_EQ(std::string::npos, redacted.find("api_token=x"));
+    ASSERT_NE(std::string::npos, redacted.find("redacted"));
+}
+
+TEST(HTTPClient, RedactPayloadPassesThroughHarmlessNonJSON) {
+    const std::string harmless = "plain text, nothing secret here";
+    ASSERT_EQ(harmless, HTTPClient::RedactPayloadForLogging(harmless));
+
+    ASSERT_EQ("", HTTPClient::RedactPayloadForLogging(""));
+}
+
+TEST(HTTPClient, RedactPayloadTruncatesOversizedBodies) {
+    const std::string big(kMaxLoggedRequestBodyChars + 100, 'a');
+    const std::string redacted = HTTPClient::RedactPayloadForLogging(
+        big, kMaxLoggedRequestBodyChars);
+
+    ASSERT_NE(std::string::npos, redacted.find("...<truncated>"));
+    ASSERT_LT(redacted.size(), big.size());
+
+    // Under the limit nothing is touched.
+    const std::string small(16, 'a');
+    ASSERT_EQ(small, HTTPClient::RedactPayloadForLogging(
+                  small, kMaxLoggedRequestBodyChars));
 }
 
 TEST(Proxy, IsConfigured) {
