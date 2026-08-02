@@ -81,8 +81,7 @@ error TimelineUploader::upload(TimelineBatch *batch) {
 
     std::string json = convertTimelineToJSON(
         batch->Events(),
-        batch->DesktopID(),
-        kTimelineAPIVersion);
+        batch->DesktopID());
     logger().trace(json);
 
     // The timeline endpoint is not part of the documented public API, but it
@@ -100,8 +99,7 @@ error TimelineUploader::upload(TimelineBatch *batch) {
 
 std::string convertTimelineToJSON(
     const std::vector<const TimelineEvent*> &timeline_events,
-    const std::string &desktop_id,
-    int apiVersion) {
+    const std::string &desktop_id) {
 
     Json::Value root;
 
@@ -109,7 +107,7 @@ std::string convertTimelineToJSON(
             i != timeline_events.end();
             ++i) {
         const TimelineEvent *event = *i;
-        Json::Value n = event->SaveToJSON(apiVersion);
+        Json::Value n = event->SaveToJSON();
         n["desktop_id"] = desktop_id;
         root.append(n);
     }

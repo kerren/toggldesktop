@@ -27,6 +27,9 @@
 #include "Poco/FileStream.h"
 #include "Poco/Logger.h"
 #include "Poco/LocalDateTime.h"
+#include <Poco/AutoPtr.h>
+#include <Poco/Channel.h>
+#include <Poco/Message.h>
 #include <Poco/SimpleFileChannel.h>
 #include <Poco/FormattingChannel.h>
 #include <Poco/PatternFormatter.h>
@@ -55,6 +58,49 @@ class Database {
 
  private:
     toggl::Database *db_;
+};
+
+// A Poco::Channel that just remembers every message logged to it, so tests
+// can assert that a particular warning was actually logged (used to verify
+// User::CompressTimeline logs when it evicts an un-uploaded timeline event
+// past the retention ceiling; see plan.md 1.3). Must be heap-allocated
+// (Poco::Channel is reference-counted and deletes itself), so always use it
+// through a Poco::AutoPtr, e.g. `Poco::AutoPtr<CapturingChannel> capture(new
+// CapturingChannel());`.
+class CapturingChannel : public Poco::Channel {
+ public:
+    void log(const Poco::Message &msg) override {
+        messages_.push_back(msg.getText());
+    }
+    bool anyMessageContains(const std::string &needle) const {
+        for (const auto &message : messages_) {
+            if (message.find(needle) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+ private:
+    std::vector<std::string> messages_;
+};
+
+// Installs a replacement channel on the named Poco::Logger for its
+// lifetime, restoring the original channel on destruction.
+class ScopedLogChannel {
+ public:
+    ScopedLogChannel(const std::string &logger_name, Poco::Channel::Ptr replacement)
+        : logger_(Poco::Logger::get(logger_name))
+        , original_channel_(logger_.getChannel()) {
+        logger_.setChannel(replacement);
+    }
+    ~ScopedLogChannel() {
+        logger_.setChannel(original_channel_);
+    }
+
+ private:
+    Poco::Logger &logger_;
+    Poco::Channel::Ptr original_channel_;
 };
 
 }  // namespace testing
@@ -187,22 +233,35 @@ TEST(User, CreateCompressedTimelineBatchForUpload) {
     too_fresh->SetTitle("notes");
     user.related.TimelineEvents.push_back(too_fresh);
 
-    // This event happened more than 7 days ago,
-    // so it must not be uploaded, just deleted
-    TimelineEvent *too_old = new TimelineEvent();
-    too_old->SetUID(user_id);
-    too_old->SetStartTime(time(0) - kTimelineSecondsToKeep - 1);  // 7 days ago
-    too_old->SetEndTime(too_old->EndTime() + 120);  // lasted 2 minutes
-    too_old->SetFilename("Notepad.exe");
-    too_old->SetTitle("diary");
-    user.related.TimelineEvents.push_back(too_old);
+    // This event happened more than 7 days ago but was never uploaded, so
+    // per 1.3 it must be KEPT (not deleted) and remain eligible for
+    // upload -- only events that were actually uploaded are pruned after
+    // kTimelineSecondsToKeep.
+    TimelineEvent *old_unuploaded = new TimelineEvent();
+    old_unuploaded->SetUID(user_id);
+    old_unuploaded->SetStartTime(time(0) - kTimelineSecondsToKeep - 1);  // just over 7 days ago
+    old_unuploaded->SetEndTime(old_unuploaded->Start() + 120);  // lasted 2 minutes
+    old_unuploaded->SetFilename("Notepad.exe");
+    old_unuploaded->SetTitle("diary");
+    user.related.TimelineEvents.push_back(old_unuploaded);
+
+    // This event happened more than 7 days ago AND has already been
+    // uploaded, so it must still be deleted, same as before 1.3.
+    TimelineEvent *old_uploaded = new TimelineEvent();
+    old_uploaded->SetUID(user_id);
+    old_uploaded->SetStartTime(time(0) - kTimelineSecondsToKeep - 2);  // just over 7 days ago
+    old_uploaded->SetEndTime(old_uploaded->Start() + 30);
+    old_uploaded->SetFilename("Notepad.exe");
+    old_uploaded->SetTitle("old and uploaded");
+    old_uploaded->SetUploaded(true);
+    user.related.TimelineEvents.push_back(old_uploaded);
 
     db.instance()->SaveUser(&user, true, &changes);
 
     user.CompressTimeline();
     std::vector<const TimelineEvent*> timeline_events = user.CompressedTimelineForUpload();
 
-    if (timeline_events.size() != 1) {
+    if (timeline_events.size() != 2) {
         std::cerr << "user.related.TimelineEvents:" << std::endl;
         for (std::vector<TimelineEvent *>::const_iterator it =
             user.related.TimelineEvents.begin();
@@ -220,7 +279,7 @@ TEST(User, CreateCompressedTimelineBatchForUpload) {
         }
     }
 
-    ASSERT_EQ(size_t(1), timeline_events.size());
+    ASSERT_EQ(size_t(2), timeline_events.size());
 
     // Compress some more, for fun and profit
     for (int i = 0; i < 100; i++) {
@@ -228,7 +287,7 @@ TEST(User, CreateCompressedTimelineBatchForUpload) {
         timeline_events = user.CompressedTimelineForUpload();
     }
 
-    ASSERT_EQ(size_t(1), timeline_events.size());
+    ASSERT_EQ(size_t(2), timeline_events.size());
 
     const TimelineEvent *ready_for_upload = timeline_events[0];
     ASSERT_TRUE(ready_for_upload->Chunked());
@@ -236,7 +295,7 @@ TEST(User, CreateCompressedTimelineBatchForUpload) {
 
     ASSERT_NE(good2->Start(), ready_for_upload->Start());
     ASSERT_NE(uploaded->Start(), ready_for_upload->Start());
-    ASSERT_NE(too_old->Start(), ready_for_upload->Start());
+    ASSERT_NE(old_unuploaded->Start(), ready_for_upload->Start());
     ASSERT_NE(too_fresh->Start(), ready_for_upload->Start());
     ASSERT_EQ(good->Start(), ready_for_upload->Start());
 
@@ -248,12 +307,80 @@ TEST(User, CreateCompressedTimelineBatchForUpload) {
     ASSERT_EQ(good->Idle(), ready_for_upload->Idle());
     ASSERT_FALSE(ready_for_upload->Uploaded());
 
-    // Fake that we have uploaded the chunked timeline event now
+    // The un-uploaded event older than kTimelineSecondsToKeep must have
+    // survived CompressTimeline() and be ready for upload too (1.3): it is
+    // never deleted just because it wasn't uploaded within 7 days.
+    const TimelineEvent *old_unuploaded_ready_for_upload = timeline_events[1];
+    ASSERT_FALSE(old_unuploaded_ready_for_upload->DeletedAt());
+    ASSERT_TRUE(old_unuploaded_ready_for_upload->Chunked());
+    ASSERT_EQ(old_unuploaded->Start(), old_unuploaded_ready_for_upload->Start());
+    ASSERT_EQ(old_unuploaded->Filename(), old_unuploaded_ready_for_upload->Filename());
+    ASSERT_EQ(old_unuploaded->Title(), old_unuploaded_ready_for_upload->Title());
+
+    // The old event that HAD been uploaded must still be deleted, exactly
+    // like before 1.3.
+    ASSERT_TRUE(old_uploaded->DeletedAt() > 0);
+
+    // Fake that we have uploaded the chunked timeline events now
     user.MarkTimelineBatchAsUploaded(timeline_events);
 
     // Now, no more events should exist for upload
     std::vector<const TimelineEvent*> left_for_upload = user.CompressedTimelineForUpload();
     ASSERT_EQ(std::size_t(0), left_for_upload.size());
+}
+
+TEST(User, CompressTimelineKeepsUnuploadedEventsUnderTheCeiling) {
+    // 1.3: an un-uploaded timeline event older than kTimelineSecondsToKeep
+    // (7 days) but well within the 90-day hard ceiling must not be deleted,
+    // so a temporary upload outage does not silently destroy activity data.
+    testing::Database db;
+
+    User user;
+    ASSERT_EQ(noError,
+              user.LoadUserAndRelatedDataFromJSONString(loadTestData(), true, false));
+
+    TimelineEvent *unuploaded = new TimelineEvent();
+    unuploaded->SetUID(user.ID());
+    unuploaded->SetStartTime(time(0) - kTimelineSecondsToKeep - 3600);  // 7 days + 1 hour ago
+    unuploaded->SetEndTime(unuploaded->Start() + 60);
+    unuploaded->SetFilename("Notepad.exe");
+    unuploaded->SetTitle("still waiting to upload");
+    user.related.TimelineEvents.push_back(unuploaded);
+
+    user.CompressTimeline();
+
+    ASSERT_FALSE(unuploaded->DeletedAt());
+}
+
+TEST(User, CompressTimelineEvictsUnuploadedEventsPastTheCeilingAndLogsIt) {
+    // 1.3: an un-uploaded timeline event older than the 90-day hard ceiling
+    // must be evicted regardless (so an account whose token is permanently
+    // revoked cannot grow the local DB without limit), and the eviction
+    // must be logged at warning.
+    testing::Database db;
+
+    User user;
+    ASSERT_EQ(noError,
+              user.LoadUserAndRelatedDataFromJSONString(loadTestData(), true, false));
+
+    TimelineEvent *ancient_unuploaded = new TimelineEvent();
+    ancient_unuploaded->SetUID(user.ID());
+    ancient_unuploaded->SetStartTime(time(0) - (91 * 24 * 60 * 60));  // 91 days ago
+    ancient_unuploaded->SetEndTime(ancient_unuploaded->Start() + 60);
+    ancient_unuploaded->SetFilename("Notepad.exe");
+    ancient_unuploaded->SetTitle("stuck forever");
+    user.related.TimelineEvents.push_back(ancient_unuploaded);
+
+    Poco::AutoPtr<testing::CapturingChannel> capture(new testing::CapturingChannel());
+    {
+        testing::ScopedLogChannel scoped_channel(
+            kModelUser, Poco::Channel::Ptr(capture));
+
+        user.CompressTimeline();
+    }
+
+    ASSERT_TRUE(ancient_unuploaded->DeletedAt() > 0);
+    ASSERT_TRUE(capture->anyMessageContains("Evicting"));
 }
 
 TEST(Database, Trim) {
@@ -1497,6 +1624,9 @@ TEST(JSON, LoginToken) {
 }
 
 TEST(JSON, ConvertTimelineToJSON) {
+    // POST /api/v9/timeline takes an array of models.TimelineEvent:
+    // desktop_id, start_time, end_time, filename, title, idle. The endpoint
+    // moved from v8 to v9 but the payload did not (plan.md 0.1).
     const std::string desktop_id("12345");
 
     TimelineEvent event;
@@ -1514,12 +1644,21 @@ TEST(JSON, ConvertTimelineToJSON) {
         ASSERT_EQ(std::size_t(1), root.size());
 
         const Json::Value v = root[0];
-        ASSERT_EQ("timeline", v["created_with"].asString());
         ASSERT_EQ(desktop_id, v["desktop_id"].asString());
-        ASSERT_EQ(Formatter::Format8601(event.Start()),
-                  v["start"].asString());
-        ASSERT_EQ(Formatter::Format8601(event.EndTime()),
-                  v["end"].asString());
+        ASSERT_EQ(event.Filename(), v["filename"].asString());
+        ASSERT_EQ(event.Title(), v["title"].asString());
+        ASSERT_EQ(event.Start(), v["start_time"].asInt64());
+        ASSERT_EQ(event.EndTime(), v["end_time"].asInt64());
+        ASSERT_TRUE(v["idle"].asBool());
+
+        // Fields that are not part of the v9 schema must not be sent.
+        ASSERT_FALSE(v.isMember("created_with"));
+        ASSERT_FALSE(v.isMember("guid"));
+        // The wrong shape that was briefly shipped must not come back.
+        ASSERT_FALSE(v.isMember("app_name"));
+        ASSERT_FALSE(v.isMember("window_title"));
+        ASSERT_FALSE(v.isMember("start"));
+        ASSERT_FALSE(v.isMember("end"));
     }
 
     event.SetIdle(false);
@@ -1532,14 +1671,8 @@ TEST(JSON, ConvertTimelineToJSON) {
         ASSERT_EQ(std::size_t(1), root.size());
 
         const Json::Value v = root[0];
-        ASSERT_EQ("timeline", v["created_with"].asString());
         ASSERT_EQ(desktop_id, v["desktop_id"].asString());
-        ASSERT_EQ(Formatter::Format8601(event.Start()),
-                  v["start"].asString());
-        ASSERT_EQ(Formatter::Format8601(event.EndTime()),
-                  v["end"].asString());
-        ASSERT_EQ(event.Filename(), v["app_name"].asString());
-        ASSERT_EQ(event.Title(), v["window_title"].asString());
+        ASSERT_FALSE(v["idle"].asBool());
     }
 
     event.SetTitle("Õhtu jõuab, päev veereb {\"\b\t");
@@ -1552,11 +1685,13 @@ TEST(JSON, ConvertTimelineToJSON) {
         ASSERT_EQ(std::size_t(1), root.size());
 
         const Json::Value v = root[0];
-        ASSERT_EQ(event.Title(), v["window_title"].asString());
+        ASSERT_EQ(event.Title(), v["title"].asString());
     }
 }
 
-TEST(JSON, ConvertTimelineToJSONUsesISO8601UTCTimestamps) {
+TEST(JSON, ConvertTimelineToJSONUsesEpochTimestamps) {
+    // v9's timeline payload kept the v8 epoch-second integers; it never
+    // switched to ISO 8601 strings the way most other v9 payloads did.
     const std::string desktop_id("12345");
 
     TimelineEvent event;
@@ -1564,6 +1699,7 @@ TEST(JSON, ConvertTimelineToJSONUsesISO8601UTCTimestamps) {
     event.SetEndTime(1469484060);    // 2016-07-25T22:01:00Z
     event.SetFilename("Google Chrome");
     event.SetTitle("Wireshark Packet Analysis - Stack Overflow");
+    event.SetIdle(true);
 
     std::vector<const TimelineEvent*> list;
     list.push_back(&event);
@@ -1573,39 +1709,46 @@ TEST(JSON, ConvertTimelineToJSONUsesISO8601UTCTimestamps) {
     ASSERT_EQ(std::size_t(1), root.size());
 
     const Json::Value v = root[0];
-    ASSERT_EQ("2016-07-25T22:00:00Z", v["start"].asString());
-    ASSERT_EQ("2016-07-25T22:01:00Z", v["end"].asString());
-    ASSERT_EQ("Google Chrome", v["app_name"].asString());
+    ASSERT_EQ(Json::Int64(1469484000), v["start_time"].asInt64());
+    ASSERT_EQ(Json::Int64(1469484060), v["end_time"].asInt64());
+    ASSERT_EQ("Google Chrome", v["filename"].asString());
     ASSERT_EQ("Wireshark Packet Analysis - Stack Overflow",
-              v["window_title"].asString());
-    // v8 field names must be gone
-    ASSERT_FALSE(v.isMember("start_time"));
-    ASSERT_FALSE(v.isMember("end_time"));
-    ASSERT_FALSE(v.isMember("filename"));
-    ASSERT_FALSE(v.isMember("title"));
+              v["title"].asString());
+    ASSERT_TRUE(v["idle"].asBool());
+
+    // The ISO-8601 + app_name/window_title shape that briefly shipped must
+    // be gone, along with the dropped guid/created_with fields.
+    ASSERT_FALSE(v.isMember("start"));
+    ASSERT_FALSE(v.isMember("end"));
+    ASSERT_FALSE(v.isMember("app_name"));
+    ASSERT_FALSE(v.isMember("window_title"));
+    ASSERT_FALSE(v.isMember("created_with"));
+    ASSERT_FALSE(v.isMember("guid"));
 }
 
-TEST(JSON, ConvertTimelineToJSONLegacyV8) {
-    const std::string desktop_id("12345");
-
+TEST(JSON, TimelineEventSaveToJSONIgnoresApiVersion) {
+    // The apiVersion branch has been collapsed entirely -- there is no v8
+    // to fall back to, so TimelineEvent::SaveToJSON must produce the same
+    // (correct) shape regardless of what is passed in.
     TimelineEvent event;
-    event.SetStartTime(time(0) - 10);
-    event.SetEndTime(time(0));
-    event.SetFilename("Is this the real life?");
-    event.SetTitle("Is this just fantasy?");
+    event.SetStartTime(1469484000);
+    event.SetEndTime(1469484060);
+    event.SetFilename("Google Chrome");
+    event.SetTitle("Wireshark Packet Analysis - Stack Overflow");
+    event.SetIdle(true);
 
-    std::vector<const TimelineEvent*> list;
-    list.push_back(&event);
-
-    Json::Value root = jsonStringToValue(
-        convertTimelineToJSON(list, desktop_id, 8));
-    ASSERT_EQ(std::size_t(1), root.size());
-
-    const Json::Value v = root[0];
-    ASSERT_EQ(event.Start(), v["start_time"].asUInt());
-    ASSERT_EQ(event.EndTime(), v["end_time"].asUInt());
-    ASSERT_EQ(event.Filename(), v["filename"].asString());
-    ASSERT_EQ(event.Title(), v["title"].asString());
+    for (int version : {8, 9, 42}) {
+        Json::Value v = event.SaveToJSON(version);
+        ASSERT_EQ(event.Filename(), v["filename"].asString());
+        ASSERT_EQ(event.Title(), v["title"].asString());
+        ASSERT_EQ(event.Start(), v["start_time"].asInt64());
+        ASSERT_EQ(event.EndTime(), v["end_time"].asInt64());
+        ASSERT_TRUE(v["idle"].asBool());
+        ASSERT_FALSE(v.isMember("created_with"));
+        ASSERT_FALSE(v.isMember("guid"));
+        ASSERT_FALSE(v.isMember("app_name"));
+        ASSERT_FALSE(v.isMember("window_title"));
+    }
 }
 
 TEST(JSON, Tag) {

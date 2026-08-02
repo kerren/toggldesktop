@@ -15,13 +15,12 @@
 
 namespace toggl {
 
-// Version of the Toggl API the timeline payload is built for.
-const int kTimelineAPIVersion = 9;
-
+// The timeline payload has been the same shape since API v8; only the
+// endpoint moved to /api/v9. There is no version-dependent branching left,
+// so convertTimelineToJSON no longer takes an API version argument.
 std::string convertTimelineToJSON(
     const std::vector<const TimelineEvent*> &timeline_events,
-    const std::string &desktop_id,
-    int apiVersion = kTimelineAPIVersion);
+    const std::string &desktop_id);
 
 class TOGGL_INTERNAL_EXPORT TimelineUploader {
  public:

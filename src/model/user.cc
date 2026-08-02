@@ -1365,12 +1365,28 @@ void User::MarkTimelineBatchAsUploaded(
     }
 }
 
+namespace {
+// Un-uploaded events are kept far longer than kTimelineSecondsToKeep (7
+// days), so a temporary upload outage does not silently destroy activity
+// data. There still needs to be a hard ceiling so an account that can never
+// upload (e.g. a permanently revoked token) does not grow the local
+// database without limit (plan.md 1.3).
+const Poco::Int64 kTimelineSecondsToKeepUnuploaded = 90 * 24 * 60 * 60;
+}  // namespace
+
 void User::CompressTimeline() {
     // Group events by app name into chunks
     std::map<std::string, TimelineEvent *> compressed;
 
-    // Older events will be deleted
+    // Events that have been uploaded already are deleted once they age past
+    // the normal retention window.
     Poco::Int64 minimum_time = time(nullptr) - kTimelineSecondsToKeep;
+
+    // Events that have NOT been uploaded are kept past minimum_time (so a
+    // failed/rejected upload does not lose the data), but are still evicted
+    // once they age past the hard ceiling below.
+    Poco::Int64 unuploaded_minimum_time =
+        time(nullptr) - kTimelineSecondsToKeepUnuploaded;
 
     // Find the chunk start time of current time.
     // then process only events that are older that this chunk start time.
@@ -1394,9 +1410,21 @@ void User::CompressTimeline() {
 
         poco_check_ptr(event);
 
-        // Delete too old timeline events
+        // Delete uploaded events once they age past the normal retention
+        // window. Un-uploaded events are kept so a failed upload does not
+        // lose the data -- unless they are older than the hard ceiling, in
+        // which case they are evicted too, and the eviction is logged since
+        // it means an account has been unable to upload for months.
         if (event->Start() < minimum_time) {
-            event->Delete();
+            if (event->Uploaded()) {
+                event->Delete();
+            } else if (event->Start() < unuploaded_minimum_time) {
+                logger().warning(
+                    "Evicting timeline event that was never uploaded and is "
+                    "older than the ", kTimelineSecondsToKeepUnuploaded,
+                    "-second retention ceiling: ", event->String());
+                event->Delete();
+            }
         }
 
         // Events that do not fit into chunk yet, ignore
