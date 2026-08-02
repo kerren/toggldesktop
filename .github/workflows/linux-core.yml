@@ -1,0 +1,49 @@
+name: Linux core (library + tests)
+
+# This is the gate for the API v8 -> v9 migration (see plan.md). It is the
+# only CI job that actually builds and runs the C++ core - the other jobs in
+# main.yml are Windows GUI-only. Runs on every push and every pull request.
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # Verified recipe, plan.md 2.1. Qt5 is installed here because
+      # find_package(Qt5... REQUIRED) in the root CMakeLists.txt is
+      # unconditional by default (TOGGL_REQUIRE_QT defaults to ON) even
+      # though neither target built below links Qt.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            qtbase5-dev qtbase5-private-dev libqt5x11extras5-dev \
+            libqt5networkauth5-dev libssl-dev libpoco-dev libjsoncpp-dev \
+            libxmu-dev libxss-dev cmake build-essential pkg-config
+
+      - name: Configure (system Poco/OpenSSL/jsoncpp, not vendored)
+        run: cmake -S . -B build -DTOGGL_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+
+      # Build ONLY these two targets. TOGGL_BUILD_TESTS=ON also defines
+      # TogglApiTest and TogglOnlineTest (src/test/CMakeLists.txt), and both
+      # make live network calls against Toggl's backend - see plan.md 2.3.
+      # Naming the targets explicitly keeps them out of this build entirely.
+      - name: Build TogglDesktopLibrary and TogglAppTest
+        run: cmake --build build --target TogglDesktopLibrary TogglAppTest -j"$(nproc)"
+
+      # The binary loads test fixtures via relative paths such as
+      # ../testdata/me.json (src/test/app_test.cc, src/test/test_data.cc), so
+      # it must run with its CWD one level below the repo root - i.e. from
+      # inside build/, not from the repo root.
+      - name: Run TogglAppTest
+        working-directory: build
+        run: ./src/test/TogglAppTest

@@ -1774,6 +1774,131 @@ TEST(User, DurationFormat) {
     ASSERT_EQ("decimal", Formatter::DurationFormat);
 }
 
+// Loads the v8-shaped testdata/me.json and the v9-shaped testdata/me_v9.json
+// (flat, no {"since":...,"data":{...}} envelope, no "since" field) into two
+// separate User objects and asserts the resulting in-memory model state is
+// identical field for field. me_v9.json was built by translating every
+// v8-only key in me.json to its v9 name (default_wid -> default_workspace_id,
+// wid -> workspace_id, cid -> client_id, pid -> project_id) while keeping
+// every value the same, so this test pins both branches of every
+// isMember("wid") ? ... : ... fork in user.cc, time_entry.cc, project.cc,
+// task.cc, client.cc and tag.cc against each other (plan.md 2.2). It is the
+// strongest available signal that the v9 read path is not half-migrated.
+//
+// Two fields are deliberately excluded from the comparison:
+//  - User::Since(): v9's /me response carries neither a top-level "since"
+//    nor "server_time" field (plan.md 1.1), so it is never expected to
+//    match v8's {"since":...} envelope. This is a known, already-documented
+//    gap, not something this test should paper over.
+//  - GUID on Project/TimeEntry: neither LoadFromJSON ever reads "guid" from
+//    the payload (it is only used to match an *existing* local model), and
+//    Project's constructor / TimeEntry's post-load EnsureGUID() calls fill
+//    it with a freshly generated random value for every new model. It is
+//    intentionally non-deterministic and would never match across two
+//    independently constructed User objects, v8/v9 or not.
+TEST(User, V8V9MeResponseParity) {
+    User v8;
+    ASSERT_EQ(noError,
+              v8.LoadUserAndRelatedDataFromJSONString(loadTestData(), true, false));
+
+    User v9;
+    ASSERT_EQ(noError,
+              v9.LoadUserAndRelatedDataFromJSONString(
+                  loadFromTestDataDir("me_v9.json"), true, false));
+
+    // --- User-level fields, including the default_wid/default_workspace_id fork ---
+    ASSERT_EQ(v8.ID(), v9.ID());
+    ASSERT_EQ(v8.APIToken(), v9.APIToken());
+    ASSERT_EQ(v8.Email(), v9.Email());
+    ASSERT_EQ(v8.Fullname(), v9.Fullname());
+    ASSERT_EQ(v8.DefaultWID(), v9.DefaultWID());
+    ASSERT_EQ(v8.RecordTimeline(), v9.RecordTimeline());
+    ASSERT_EQ(v8.TimeOfDayFormat(), v9.TimeOfDayFormat());
+    ASSERT_EQ(v8.BeginningOfWeek(), v9.BeginningOfWeek());
+
+    // --- Workspaces: not dual-shaped, but every field flows through the
+    //     same LoadUserAndRelatedDataFromJSON path so this doubles as an
+    //     end-to-end sanity check for the whole load. ---
+    ASSERT_EQ(v8.related.Workspaces.size(), v9.related.Workspaces.size());
+    for (size_t i = 0; i < v8.related.Workspaces.size(); i++) {
+        Workspace *a = v8.related.Workspaces[i];
+        Workspace *b = v9.related.Workspaces[i];
+        ASSERT_EQ(a->ID(), b->ID());
+        ASSERT_EQ(a->Name(), b->Name());
+        ASSERT_EQ(a->Premium(), b->Premium());
+        ASSERT_EQ(a->Admin(), b->Admin());
+        ASSERT_EQ(a->OnlyAdminsMayCreateProjects(), b->OnlyAdminsMayCreateProjects());
+        ASSERT_EQ(a->ProjectsBillableByDefault(), b->ProjectsBillableByDefault());
+        ASSERT_EQ(a->Business(), b->Business());
+    }
+
+    // --- Clients: wid/workspace_id fork (client.cc:48) ---
+    ASSERT_EQ(v8.related.Clients.size(), v9.related.Clients.size());
+    for (size_t i = 0; i < v8.related.Clients.size(); i++) {
+        Client *a = v8.related.Clients[i];
+        Client *b = v9.related.Clients[i];
+        ASSERT_EQ(a->ID(), b->ID());
+        ASSERT_EQ(a->Name(), b->Name());
+        ASSERT_EQ(a->WID(), b->WID());
+    }
+
+    // --- Projects: hex_color/color, wid/workspace_id, cid/client_id forks
+    //     (project.cc:111,119,123) ---
+    ASSERT_EQ(v8.related.Projects.size(), v9.related.Projects.size());
+    for (size_t i = 0; i < v8.related.Projects.size(); i++) {
+        Project *a = v8.related.Projects[i];
+        Project *b = v9.related.Projects[i];
+        ASSERT_EQ(a->ID(), b->ID());
+        ASSERT_EQ(a->Name(), b->Name());
+        ASSERT_EQ(a->WID(), b->WID());
+        ASSERT_EQ(a->CID(), b->CID());
+        ASSERT_EQ(a->Color(), b->Color());
+        ASSERT_EQ(a->Active(), b->Active());
+        ASSERT_EQ(a->Billable(), b->Billable());
+        ASSERT_EQ(a->ClientName(), b->ClientName());
+    }
+
+    // --- Tasks: pid/project_id, wid/workspace_id forks (task.cc:43,47) ---
+    ASSERT_EQ(v8.related.Tasks.size(), v9.related.Tasks.size());
+    for (size_t i = 0; i < v8.related.Tasks.size(); i++) {
+        Task *a = v8.related.Tasks[i];
+        Task *b = v9.related.Tasks[i];
+        ASSERT_EQ(a->ID(), b->ID());
+        ASSERT_EQ(a->Name(), b->Name());
+        ASSERT_EQ(a->WID(), b->WID());
+        ASSERT_EQ(a->PID(), b->PID());
+        ASSERT_EQ(a->Active(), b->Active());
+    }
+
+    // --- Tags: wid/workspace_id fork (tag.cc:35) ---
+    ASSERT_EQ(v8.related.Tags.size(), v9.related.Tags.size());
+    for (size_t i = 0; i < v8.related.Tags.size(); i++) {
+        Tag *a = v8.related.Tags[i];
+        Tag *b = v9.related.Tags[i];
+        ASSERT_EQ(a->ID(), b->ID());
+        ASSERT_EQ(a->Name(), b->Name());
+        ASSERT_EQ(a->WID(), b->WID());
+    }
+
+    // --- Time entries: wid/workspace_id fork (time_entry.cc:479) ---
+    ASSERT_EQ(v8.related.TimeEntries.size(), v9.related.TimeEntries.size());
+    for (size_t i = 0; i < v8.related.TimeEntries.size(); i++) {
+        TimeEntry *a = v8.related.TimeEntries[i];
+        TimeEntry *b = v9.related.TimeEntries[i];
+        ASSERT_EQ(a->ID(), b->ID());
+        ASSERT_EQ(a->WID(), b->WID());
+        ASSERT_EQ(a->PID(), b->PID());
+        ASSERT_EQ(a->TID(), b->TID());
+        ASSERT_EQ(a->Description(), b->Description());
+        ASSERT_EQ(a->Billable(), b->Billable());
+        ASSERT_EQ(a->DurationInSeconds(), b->DurationInSeconds());
+        ASSERT_EQ(a->StartTime(), b->StartTime());
+        ASSERT_EQ(a->StopTime(), b->StopTime());
+        ASSERT_EQ(a->DurOnly(), b->DurOnly());
+        ASSERT_EQ(a->Tags(), b->Tags());
+    }
+}
+
 TEST(Proxy, IsConfigured) {
     Proxy p;
     ASSERT_FALSE(p.IsConfigured());

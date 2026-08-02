@@ -1,0 +1,29 @@
+{
+	"id":10471231,"api_token":"30eb0ae954b536d2f6628f7fec47beb6","default_workspace_id":123456788,"email":"johnsmith@toggl.com","fullname":"John Smith","timeofday_format":"H:mm","date_format":"DD.MM.YYYY","beginning_of_week":1,"language":"en_US","image_url":"https://www.toggl.com/system/avatars/1/2/3/small/imgres.png","created_at":"2013-01-01T00:00:00+00:00","updated_at":"2013-09-12T00:22:05+00:00","country_id":59,"record_timeline":true,"render_timeline":true,"timeline_enabled":true,"timeline_experiment":true,"should_upgrade":false,"achievements_enabled":false,"timezone":"Europe/Tallinn","openid_enabled":true,"openid_email":"john.smith@gmail.com","send_product_emails":true,"send_weekly_report":false,"send_timer_notifications":true,
+	"workspaces":[
+		{"id":123456788,"name":"stuff","premium":false,"admin":true,"default_hourly_rate":0,"default_currency":"USD","only_admins_may_create_projects":false,"only_admins_see_billable_rates":false,"rounding":1,"rounding_minutes":0,"at":"2013-07-02T13:45:36+00:00"},
+		{"id":123456789,"name":"Toggl","premium":true,"admin":true,"default_hourly_rate":0,"default_currency":"USD","only_admins_may_create_projects":true,"only_admins_see_billable_rates":false,"rounding":1,"rounding_minutes":15,"at":"2013-08-28T13:22:21+00:00"}
+	],
+	"clients":[
+		{"id":878318,"guid":"59b464cd-0f8e-e601-ff44-f135225a6738","workspace_id":123456788,"name":"Big Client","at":"2013-03-27T13:17:18+00:00"}
+	],
+	"projects":[
+		{"id":2598305,"guid":"2f0b8f51-f898-d992-3e1a-6bc261fc41xf","workspace_id":123456789,"name":"Testing stuff","billable":true,"is_private":false,"active":false,"template":false,"at":"2013-05-13T10:19:24+00:00","color":"#fb8b14","auto_estimates":false},
+		{"id":2567324,"workspace_id":123456789,"client_id":1385144,"name":"Even more work","billable":true,"is_private":true,"active":true,"template":false,"at":"2013-06-05T11:32:47+00:00","color":"#999999","auto_estimates":false}
+	],
+	"tasks":[
+		{"id":1894794,"name":"blog (writing)","workspace_id":123456789,"project_id":2598305,"active":true,"at":"2013-06-05T07:58:41+00:00","estimated_seconds":0},
+		{"id":1879027,"name":"dadsad","workspace_id":123456789,"project_id":2598305,"active":true,"at":"2013-05-20T07:21:58+00:00","estimated_seconds":0}
+	],
+	"time_entries":[
+		{"id":89818605,"guid":"07fba193-91c4-0ec8-2894-820df0548a8f","workspace_id":123456789,"project_id":2567324,"billable":true,"start":"2013-09-05T06:33:50+00:00","stop":"2013-09-05T08:19:46+00:00","duration":6356,"description":"Important things","tags":[""],"duronly":false,"at":"2013-09-05T08:19:45+00:00"},
+		{"id":89833438,"guid":"6c97dc31-582e-7662-1d6f-5e9d623b1685","workspace_id":123456789,"project_id":2567324,"billable":true,"start":"2013-09-05T08:19:47+00:00","stop":"2013-09-05T08:41:02+00:00","duration":1275,"description":"More work","tags":[""],"duronly":false,"at":"2013-09-05T08:41:00+00:00"},
+		{"id":89837259,"guid":"6a958efd-0e9a-d777-7e19-001b2d7ced92","workspace_id":123456789,"project_id":2567324,"billable":true,"start":"2013-09-05T08:41:04+00:00","stop":"2013-09-05T09:09:15+00:00","duration":1691,"description":"arendus käib","tags":[""],"duronly":false,"at":"2013-09-05T09:09:13+00:00"},
+		{"id":89837444,"workspace_id":123456789,"project_id":2567324,"start":"2013-09-05T12:15:00+00:00","stop":"2013-09-05T09:09:15+00:00","duration":360,"description":"guidless entry","at":"2013-09-05T11:09:13+00:00"},
+		{"id":89837445,"workspace_id":123456789,"project_id":2567324,"start":"0003-03-16T-7:-19:-24Z","stop":"0003-03-16T-5:-52:-51Z","duration":360,"description":"guidless entry","at":"2013-09-05T11:09:13+00:00"}
+	],
+	"tags":[
+		{"id":27457022,"name":"billed","workspace_id":123456788},
+		{"id":36253522,"name":"create new","workspace_id":123456788,"at":"2013-10-15T08:51:46+00:00","guid":"041390ba-ed9c-b477-b949-1a4ebb60a9ce"}
+	]
+}

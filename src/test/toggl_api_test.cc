@@ -11,6 +11,7 @@
 #include "model/time_entry.h"
 #include "toggl_api.h"
 #include "toggl_api_private.h"
+#include "urls.h"
 
 #include "test_data.h"
 
@@ -313,6 +314,11 @@ class App {
         toggl_set_log_path(STR("test.log"));
 
         ctx_ = toggl_context_init(STR("tests"), STR("0.1"));
+
+        // Force the "test" environment so urls::RequestsAllowed() becomes
+        // false and no test built on this fixture can issue a live HTTP
+        // request against staging/production (see plan.md 2.3).
+        toggl_set_environment(ctx_, STR("test"));
 
         poco_assert(toggl_set_db_path(ctx_, STR("test.db")));
 
@@ -724,6 +730,16 @@ TEST(toggl_api, toggl_set_environment) {
     std::string res(to_string(env));
     free(env);
     ASSERT_EQ("test", res);
+}
+
+TEST(toggl_api, ConstructingAppDisallowsLiveRequests) {
+    // testing::App's constructor calls toggl_set_environment(ctx_, "test")
+    // before anything else, which flips urls::RequestsAllowed() to false.
+    // This proves the fixture itself is enough to keep every test in this
+    // binary from ever issuing a real HTTP request against staging or
+    // production (see plan.md 2.3) -- no test needs to remember to do it.
+    testing::App app;
+    ASSERT_FALSE(urls::RequestsAllowed());
 }
 
 TEST(toggl_api, toggl_set_update_path) {
