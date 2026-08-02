@@ -1433,6 +1433,25 @@ void Context::executeUpdateCheck() {
 
 error Context::downloadUpdate() {
     try {
+        // W2-E (plan.md 2b.2): the in-app update check is disabled outright.
+        // Both this function and fetchMessage() below point at the
+        // discontinued toggl-open-source/toggldesktop project --
+        // toggl.github.io/toggldesktop/assets/updates-link.txt here, and
+        // raw.githubusercontent.com/toggl-open-source/toggldesktop/... in
+        // fetchMessage() -- which this fork does not control and must not
+        // query: at best the data is stale, at worst it surfaces an
+        // upstream deprecation notice to users of this fork. No product
+        // decision has been made on where this fork's own update metadata
+        // should live (repointing needs a maintainer call), so this fails
+        // closed and silently -- returning noError here means the
+        // displayError() call in executeUpdateCheck() never reaches the UI
+        // -- rather than guessing at a replacement host.
+        //
+        // To re-enable/repoint later: delete this early return (and the
+        // matching one at the top of fetchMessage()) and update the
+        // req.host/relative_url values below to a real host.
+        return noError;
+
         if (update_check_disabled_) {
             return noError;
         }
@@ -1570,6 +1589,14 @@ error Context::downloadUpdate() {
 
 error Context::fetchMessage(const bool periodic) {
     try {
+        // W2-E (plan.md 2b.2): disabled -- see the top of downloadUpdate()
+        // above for the full rationale. This endpoint lives at
+        // raw.githubusercontent.com/toggl-open-source/toggldesktop, the
+        // same discontinued upstream project. Callers of fetchMessage()
+        // already discard its return value, so this was already silent as
+        // far as the UI is concerned; this early return additionally stops
+        // it from ever querying the archived host.
+        return noError;
 
         // Check if in-app messaging is supported and show
         if (!UI()->CanDisplayMessage()) {
@@ -1843,7 +1870,11 @@ void Context::onTimelineUpdateServerSettings(Poco::Util::TimerTask&) {  // NOLIN
     req.basic_auth_username = apitoken;
     req.basic_auth_password = "api_token";
 
-    HTTPResponse resp = TogglClient::GetInstance().Post(req);
+    // W2-D handoff (plan.md 1.2): fire-and-forget preference write --
+    // silentPost() still surfaces the real error via displayError() below,
+    // it just does not let a 5xx here stall unrelated sync through the
+    // ServerStatus gate.
+    HTTPResponse resp = TogglClient::GetInstance().silentPost(req);
     if (resp.err != noError) {
         displayError(resp.err);
         logger.error(resp.body);
@@ -1947,7 +1978,10 @@ void Context::onSendFeedback(Poco::Util::TimerTask&) {  // NOLINT
     req.basic_auth_password = api_token_name;
     req.form = &form;
 
-    HTTPResponse resp = TogglClient::GetInstance().Post(req);
+    // W2-D handoff (plan.md 1.2, named explicitly): feedback submission is
+    // best-effort -- silentPost() still surfaces the real error below, it
+    // just does not let a feedback-service 5xx stall time-entry sync.
+    HTTPResponse resp = TogglClient::GetInstance().silentPost(req);
     logger.debug("Feedback result: " + resp.err);
     if (resp.err != noError) {
         displayError(resp.err);
@@ -4557,7 +4591,10 @@ error Context::OpenReportsInBrowser() {
     req.basic_auth_username = apitoken;
     req.basic_auth_password = "api_token";
 
-    HTTPResponse resp = TogglClient::GetInstance().Post(req);
+    // W2-D handoff (plan.md 1.2): convenience feature -- silentPost() still
+    // surfaces the real error below, it just does not let a 5xx here stall
+    // unrelated sync through the ServerStatus gate.
+    HTTPResponse resp = TogglClient::GetInstance().silentPost(req);
     if (resp.err != noError) {
         return displayError(resp.err);
     }
@@ -5489,7 +5526,11 @@ error Context::pullBatchedUserData() {
         Json::Reader reader;
         reader.parse(user_data_json, json);
 
-        std::cerr << "PULLED: " << std::endl << json.toStyledString() << std::endl;
+        // W2-E (plan.md 2.5): this used to also dump the full, unredacted
+        // pull response to std::cerr -- user data, bypassing the logger
+        // entirely (no level control, no rotation). The logger.debug()
+        // call below already carries the same content under normal level
+        // control.
         logger.debug("Sync server pull response: ", json.toStyledString());
 
         if (err != noError) {
@@ -5610,9 +5651,20 @@ error Context::pushBatchedChanges(
             req.basic_auth_username = api_token;
             req.basic_auth_password = "api_token";
 
-            auto response = TogglClient::GetInstance().Post(req);
+            // W2-D handoff (plan.md 1.2): sync.toggl.com is a different
+            // host from api.track.toggl.com. Routing this through the
+            // gated Post() fed a sync.toggl.com 5xx into the
+            // api.track.toggl.com ServerStatus gate, stalling unrelated
+            // REST sync. silentPost() still returns the real error below
+            // (error surfacing is unaffected), it just does not trip that
+            // gate. Note: unlike silentGet, silentPost does not disable
+            // request logging.
+            auto response = TogglClient::GetInstance().silentPost(req);
 
-            std::cerr << "REQUEST: " << request.toStyledString() << std::endl;
+            // W2-E (plan.md 2.5): this used to also dump the full,
+            // unredacted request/response to std::cerr -- user data,
+            // bypassing the logger entirely. The logger.debug() calls
+            // already carry the same content under normal level control.
             logger.debug("Sync request ", lastRequestUUID_, ": ", request.toStyledString());
 
             if (response.err != noError) {
@@ -5624,7 +5676,6 @@ error Context::pushBatchedChanges(
             Json::Value responseJson;
             reader.parse(response.body, responseJson);
 
-            std::cerr << "RESPONSE: " << responseJson.toStyledString() << std::endl;
             logger.debug("Sync response to request ", lastRequestUUID_, ": ", responseJson.toStyledString());
 
             error err = syncHandleResponse(responseJson["clients"], clients);
@@ -5983,9 +6034,15 @@ error Context::pushEntries(
             }
             error_found = true;
             error_message = resp.err;
-            if (resp.status_code == 429) {
-                error_message = error(kRateLimit);
-            }
+            // W2-E handoff (H3): a separate
+            // `if (resp.status_code == 429) error_message = error(kRateLimit);`
+            // branch used to live here. It is genuinely redundant: W2-D's
+            // StatusCodeToError(429) mapping (https_client.cc) already
+            // returns kRateLimit, and HTTPClient::request's client-side
+            // self-ban short-circuit also sets resp.err = kRateLimit
+            // directly -- so resp.err already equals error(kRateLimit) in
+            // every case where resp.status_code == 429 can be true.
+            // Reassigning it was a no-op. Removed.
 
             // Mark the time entry as unsynced now
             (*it)->SetUnsynced();
@@ -5996,7 +6053,15 @@ error Context::pushEntries(
                 trigger_sync_ = false;
             }
 
-            if (kBadRequestError == resp.err) {
+            // W2-E handoff (H2): kUnprocessableEntityError (HTTP 422) is a
+            // validation rejection just like kBadRequestError (HTTP 400) --
+            // resending the same payload can never succeed. Without this,
+            // a 422 fell through to plain SetUnsynced() above with
+            // ValidationError left empty, so NeedsPush() (which requires
+            // ValidationError().empty()) stayed true and the entry was
+            // re-pushed and re-rejected on every sync cycle forever.
+            if (kBadRequestError == resp.err ||
+                    kUnprocessableEntityError == resp.err) {
                 error_message = resp.body;
                 (*it)->SetValidationError(error_message);
             }
@@ -6120,7 +6185,14 @@ error Context::syncPull(
         req.basic_auth_username = email;
         req.basic_auth_password = password;
 
-        HTTPResponse resp = TogglClient::GetInstance().Get(req);
+        // W2-D handoff (plan.md 1.2): sync.toggl.com is a different host
+        // from api.track.toggl.com -- see the matching comment on the
+        // /push/{uuid} POST in pushBatchedChanges(). silentGet() still
+        // returns the real error below; it also turns off this request's
+        // HTTP-level trace logging (the silentGet/silentPost asymmetry
+        // documented in https_client.h), which only affects diagnostic
+        // detail, not error surfacing.
+        HTTPResponse resp = TogglClient::GetInstance().silentGet(req);
         if (resp.err != noError) {
             return resp.err;
         }
@@ -6779,7 +6851,12 @@ error Context::PullCountries() {
         HTTPRequest req;
         req.host = urls::API();
         req.relative_url = "/api/v9/countries";
-        HTTPResponse resp = TogglClient::GetInstance().Get(req);
+        // W2-D handoff (plan.md 1.2): background dropdown fill running on
+        // a detached thread -- silentGet() still returns the real error
+        // above; it also turns off this request's HTTP-level trace
+        // logging (the silentGet/silentPost asymmetry documented in
+        // https_client.h).
+        HTTPResponse resp = TogglClient::GetInstance().silentGet(req);
         if (resp.err != noError) {
             return resp.err;
         }
