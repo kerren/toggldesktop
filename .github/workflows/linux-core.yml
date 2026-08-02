@@ -18,24 +18,24 @@ jobs:
         with:
           fetch-depth: 1
 
-      # Neither TogglDesktopLibrary nor TogglAppTest links Qt, so this job
-      # builds with TOGGL_REQUIRE_QT=OFF and does not install Qt5 at all -
-      # that option gates both the find_package(Qt5... REQUIRED) calls and
-      # the add_subdirectory for the Linux GUI, which is the only thing that
-      # actually needs Qt. Verified headless: configures, builds and passes.
+      # Qt5 must be installed even though neither target built below links it.
+      # TOGGL_REQUIRE_QT=OFF is NOT usable yet: it gates the Qt5 find_package
+      # calls and the Linux GUI subdirectory, but third_party/CMakeLists.txt
+      # still builds Qxt and Bugsnag unconditionally and those link Qt5::Core
+      # and Qt5::Widgets directly. Dropping the Qt packages here therefore
+      # fails at the CMake generate step with "Target Qxt links to Qt5::Core
+      # but the target was not found". Gating those two vendored targets is
+      # what would actually let this job skip Qt - see plan.md 2.1.
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libssl-dev libpoco-dev libjsoncpp-dev \
+            qtbase5-dev qtbase5-private-dev libqt5x11extras5-dev \
+            libqt5networkauth5-dev libssl-dev libpoco-dev libjsoncpp-dev \
             libxmu-dev libxss-dev cmake build-essential pkg-config
 
       - name: Configure (system Poco/OpenSSL/jsoncpp, not vendored)
-        run: |
-          cmake -S . -B build \
-            -DTOGGL_BUILD_TESTS=ON \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DTOGGL_REQUIRE_QT=OFF
+        run: cmake -S . -B build -DTOGGL_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
 
       # Build ONLY these two targets. TOGGL_BUILD_TESTS=ON also defines
       # TogglApiTest and TogglOnlineTest (src/test/CMakeLists.txt), and both

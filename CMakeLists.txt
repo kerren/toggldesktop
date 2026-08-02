@@ -105,10 +105,14 @@ if (TOGGL_BUILD_TESTS)
     add_subdirectory(src/test)
 endif()
 # The Linux GUI links Qt5::Widgets and friends directly, so it can only be
-# configured when Qt5 discovery actually ran. Gating it on the same option is
-# what makes TOGGL_REQUIRE_QT=OFF usable: a headless build (CI running only
-# TogglDesktopLibrary and TogglAppTest, neither of which links Qt) can then
-# skip installing Qt entirely.
+# configured when Qt5 discovery actually ran.
+#
+# NOTE: gating this is necessary but NOT sufficient for a headless build.
+# third_party/CMakeLists.txt still builds Qxt and Bugsnag unconditionally and
+# links them against Qt5::Core/Qt5::Widgets, so configuring with
+# TOGGL_REQUIRE_QT=OFF on a machine that has no Qt5 installed still fails at
+# the generate step. Gating those two vendored targets as well is the
+# remaining work before CI can skip installing Qt (plan.md 2.1).
 if(TOGGL_REQUIRE_QT)
     add_subdirectory(src/ui/linux/TogglDesktop)
 endif()
