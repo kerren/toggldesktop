@@ -304,6 +304,15 @@ void TimeEntry::SetStartUserInput(const std::string &value,
                                   bool keepEndTimeFixed) {
     Poco::Int64 start = Formatter::Parse8601(value);
     if (IsTracking()) {
+        // NOTE (plan.md 1.9): a running entry is encoded here as the
+        // NEGATIVE EPOCH START TIME (-start), which is the v8 convention.
+        // v9's spec documents running entries as "negative duration, -1
+        // recommended" -- it does not say -1 is mandatory, and a negative
+        // epoch value *is* negative, so this is expected to still work.
+        // This is unverified against the live v9 API (no token available
+        // in this environment) and sits on the app's most important write
+        // path. Do NOT change this encoding without live verification --
+        // see plan.md Phase 3 item 7 (§8) before touching it.
         SetDurationInSeconds(-start, true);
     } else {
         auto stop = StopTime();
@@ -331,6 +340,9 @@ void TimeEntry::SetDurationUserInput(const std::string &value) {
         time_t now = time(nullptr);
         time_t start = now - seconds;
         SetStartTime(start, true);
+        // NOTE (plan.md 1.9): same negative-epoch v8 running-entry encoding
+        // as SetStartUserInput() above -- see the comment there. Pending
+        // live verification (plan.md §8 item 7); do not change without it.
         SetDurationInSeconds(-start, true);
     } else {
         SetDurationInSeconds(seconds, true);

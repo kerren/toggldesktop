@@ -56,7 +56,12 @@ Json::Value Client::SaveToJSON(int) const {
         n["id"] = Json::UInt64(ID());
     }
     n["name"] = Formatter::EscapeJSONString(Name());
-    // V9 inconsistency - Clients' Workspace ID is still `wid`
+    // INTENTIONAL, DO NOT "FIX": unlike every other model (time entries,
+    // projects, tags, tasks all send "workspace_id" on v9), the v9 API
+    // genuinely kept the legacy field name "wid" for the client workspace
+    // field. This is confirmed against the v9 spec (see plan.md, "Verified
+    // healthy" / 0.4) -- it is not a leftover v8 payload shape. Sending
+    // "workspace_id" here instead would break client creation/update.
     n["wid"] = Json::UInt64(WID());
     n["guid"] = GUID();
     n["ui_modified_at"] = Json::UInt64(UIModifiedAt());
