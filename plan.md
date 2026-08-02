@@ -503,10 +503,28 @@ Cannot be done from the dev container: egress blocks `toggl.com` hosts, and
    shows fewer entries than users expect, and 1.1 stops being optional.
 9. Confirm the observed 429 threshold and whether any `Retry-After`-equivalent
    header is sent — sizes the token bucket in 1.8.
+
+   *W2-D (2026-08-01) sized the client-side pacer on an unverified assumption.*
+   `kMinRequestIntervalMillis` is **1000 ms**, taken directly from the documented
+   "~1 req/s per token+IP" figure with **no safety margin** — the client runs at
+   100% of the stated budget, so clock jitter or reordering can still produce a
+   429. If live testing shows 429s continuing under normal sync load, raise it to
+   1100-1200 ms. If the real limit is higher than 1/s, lowering it makes large
+   pushes much faster. Also unverified: whether v9 sends **any**
+   `Retry-After`-equivalent header. The client parses `Retry-After` as integer
+   seconds (capped at 300s) and falls back to incremental backoff when absent —
+   confirm the header name and format, since a differently-named header (e.g.
+   `X-RateLimit-Reset`) would be silently ignored.
 10. `desktop.track.toggl.com/stream` still accepts the websocket upgrade
     (`src/websocket_client.cc:125`). Failure is silent and permanent: it retries
     every 45s forever and degrades to ~15-30 minute polling with no user-visible
     error.
+11. **Confirm v9 uses 422 for validation rejections, and capture a real 422 body.**
+    W2-D added explicit 422 handling on the assumption that v9 returns 422 (not
+    400) for validation failures; the spec was not re-fetchable from the
+    container. If v9 actually uses 400, the `kUnprocessableEntityError` path is
+    dead code and existing 400 handling already covers it. If it uses both, the
+    two must behave identically at the push call site (`context.cc` — see W2-E).
 
 `src/test/online_test.cc` is an existing live end-to-end suite (23 tests; signs up
 a throwaway user, creates entries and projects) that nothing currently runs. It is
