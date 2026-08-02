@@ -64,23 +64,31 @@ live server see [this guide](https://github.com/toggl-open-source/toggldesktop/w
 
 ### Dependencies
 
-You'll need Qt 5 (5.12 or higher) — in particular **qtbase**, including its private
-headers — plus QtNetwork, QtNetworkAuth, QtDBus and QtX11Extras.
+You'll need Qt 5 (5.12 or higher). CMake requires each of these modules in turn, and
+fails at the configure step on the first one it can't find:
 
-On Debian/Ubuntu, the two packages that are easy to miss — and that CMake fails on
-first — are **qtbase** and **QtNetworkAuth**:
+| CMake looks for | Debian/Ubuntu package |
+| --- | --- |
+| `Qt5Widgets`, `Qt5DBus`, `Qt5Network` | `qtbase5-dev` |
+| `Qt5Widgets` private headers | `qtbase5-private-dev` |
+| `Qt5NetworkAuth` | `libqt5networkauth5-dev` |
+| `Qt5X11Extras` | `libqt5x11extras5-dev` |
+
+On Debian/Ubuntu, that means:
 
 ```bash
 $ sudo apt install qtbase5-dev
+$ sudo apt install qtbase5-private-dev
 $ sudo apt install libqt5networkauth5-dev
+$ sudo apt install libqt5x11extras5-dev
 ```
 
-Then the rest of the Qt modules and the mandatory system libraries:
+Or in one go, together with the mandatory system libraries:
 
 ```bash
-$ sudo apt install qtbase5-private-dev libqt5x11extras5-dev \
-    libxss-dev libxmu-dev libssl-dev build-essential cmake pkg-config \
-    libgl-dev libreadline-dev
+$ sudo apt install qtbase5-dev qtbase5-private-dev libqt5networkauth5-dev \
+    libqt5x11extras5-dev libxss-dev libxmu-dev libssl-dev \
+    build-essential cmake pkg-config libgl-dev libreadline-dev
 ```
 
 `libXScrnSaver` (`libxss-dev` on deb-based distros, `libXScrnSaver-devel` on rpm-based)
