@@ -83,13 +83,18 @@ $ sudo apt install libqt5networkauth5-dev
 $ sudo apt install libqt5x11extras5-dev
 ```
 
-Or in one go, together with the mandatory system libraries:
+**Or just install everything in one go.** This is the full, verified list — Qt, the
+mandatory system libraries, and the optional-but-recommended ones:
 
 ```bash
 $ sudo apt install qtbase5-dev qtbase5-private-dev libqt5networkauth5-dev \
     libqt5x11extras5-dev libxss-dev libxmu-dev libssl-dev \
-    build-essential cmake pkg-config libgl-dev libreadline-dev
+    build-essential cmake pkg-config libgl-dev libreadline-dev \
+    libpoco-dev libjsoncpp-dev
 ```
+
+<sub>Verified on Ubuntu 24.04 with Qt 5.15.13: this list takes a clean checkout through
+`cmake ..` and a full GUI build with no further packages needed.</sub>
 
 `libXScrnSaver` (`libxss-dev` on deb-based distros, `libXScrnSaver-devel` on rpm-based)
 is required for idle detection.
@@ -98,12 +103,16 @@ If Qt is not installed from your distribution's package manager, set the
 `CMAKE_PREFIX_PATH` environment variable to point at the `lib/cmake` folder of the Qt
 version you want to use.
 
-These dependencies are optional and will be bundled if the `USE_BUNDLED_LIBRARIES` CMake
-argument is set, or if your system does NOT have their development packages installed:
+These dependencies are optional — they get built from `third_party/` if the
+`USE_BUNDLED_LIBRARIES` CMake argument is set, or if your system does NOT have their
+development packages installed:
  * POCO (`libpoco-dev`)
  * Lua
  * jsoncpp (`libjsoncpp-dev`)
  * Qxt
+
+Installing `libpoco-dev` and `libjsoncpp-dev` is worth it — without them CMake falls
+back to compiling the vendored copy of POCO from source, which dominates build time.
 
 These libraries are bundled regardless of your system:
  * bugsnag-qt
